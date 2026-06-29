@@ -1,3 +1,17 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -77,37 +91,18 @@ def save_portfolio_memory():
         except WorksheetNotFound:
             worksheet = spreadsheet.add_worksheet(title=PORTFOLIO_SHEET_NAME, rows=1000, cols=3)
 
-        col_a = worksheet.col_values(1)
-        key_to_row = {}
-        for i, key in enumerate(col_a):
-            row_idx = i + 1
-            if row_idx == 1 and key == "Key":
-                continue
-            if key:
-                key_to_row[key] = row_idx
+        # 데이터 무결성을 위해 기존 데이터를 덮어쓰기 (초기화 후 일괄 삽입)
+        worksheet.clear()
+        worksheet.append_row(["Key", "Data", "Updated_At"])
 
-        batch_updates = []
-        rows_to_append = []
+        rows_to_insert = []
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
         for key, df in st.session_state["portfolio_memory"].items():
             data_str = df.to_json(orient="records", date_format="iso")
-            if key in key_to_row:
-                row_idx = key_to_row[key]
-                batch_updates.append({
-                    "range": f"B{row_idx}:C{row_idx}",
-                    "values": [[data_str, now_str]],
-                })
-            else:
-                rows_to_append.append([key, data_str, now_str])
+            rows_to_insert.append([key, data_str, now_str])
 
-        if batch_updates:
-            worksheet.batch_update(batch_updates, value_input_option="USER_ENTERED")
-
-        if rows_to_append:
-            if not col_a or col_a[0] != "Key":
-                rows_to_append = [["Key", "Data", "Updated_At"]] + rows_to_append
-            worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
+        if rows_to_insert:
+            worksheet.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
     except Exception as e:
         st.error(f"포트폴리오 클라우드 DB 동기화 실패: {e}")
 
