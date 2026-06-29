@@ -1,0 +1,6 @@
+﻿secrets.json
+*.pkl
+portfolio_memory.pkl
+__pycache__/
+.vscode/
+.DS_Store

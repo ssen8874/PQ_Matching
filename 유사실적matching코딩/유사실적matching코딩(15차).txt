@@ -1,0 +1,2383 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+import io
+import math
+import os
+import pickle
+import re
+from datetime import datetime, timedelta
+
+import gspread
+import pandas as pd
+import streamlit as st
+from google.oauth2.service_account import Credentials
+from gspread.exceptions import WorksheetNotFound
+from openpyxl.utils import get_column_letter
+
+SPREADSHEET_ID = "1OFW0zizcZZQQacyVuKH6tbqr9wsBYG74pmG7b7daIH8"
+COMPANY_SHEET_NAME = "회사실적"
+CRITERIA_SHEET_NAME = "지자체별 세부평가기준"
+REQUEST_SHEET_NAME = "세부평가기준_추가요청"
+PERFORMANCE_REQUEST_SHEET_NAME = "회사실적_추가요청"
+PERFORMANCE_HEADERS = [
+    "사업구분", "공종", "사 업 명", "사업개요", "발 주 처",
+    "시작일", "종료일", "준공금액", "지분금액", "건수", "가중치",
+    "비고", "실적증명서 발급여부",
+]
+SECRETS_PATH = "secrets.json"
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+WON_PER_EOK = 100_000_000
+SIDEBAR_SLIM_DIVIDER = (
+    "<hr style='margin-top: 5px; margin-bottom: 5px; border: none; "
+    "border-top: 1px solid #e6e6e6;'/>"
+)
+PORTFOLIO_DB_PATH = "portfolio_memory.pkl"
+
+
+def load_portfolio_memory():
+    if "portfolio_memory" not in st.session_state:
+        if os.path.exists(PORTFOLIO_DB_PATH):
+            try:
+                with open(PORTFOLIO_DB_PATH, "rb") as f:
+                    st.session_state["portfolio_memory"] = pickle.load(f)
+            except Exception:
+                st.session_state["portfolio_memory"] = {}
+        else:
+            st.session_state["portfolio_memory"] = {}
+
+
+def save_portfolio_memory():
+    with open(PORTFOLIO_DB_PATH, "wb") as f:
+        pickle.dump(st.session_state["portfolio_memory"], f)
+
+
+def convert_df_to_excel(df):
+    output = io.BytesIO()
+    # 1. 엑셀 추출용으로 데이터 복제 및 정제
+    export_df = df.copy()
+    # 2. 화면 표출용 슬래시를 다시 원본 줄바꿈으로 복원 (데이터 복구)
+    if "착수일" in export_df.columns:
+        export_df["착수일"] = export_df["착수일"].astype(str).str.replace(" / ", "\n", regex=False)
+    if "준공일" in export_df.columns:
+        export_df["준공일"] = export_df["준공일"].astype(str).str.replace(" / ", "\n", regex=False)
+    # 3. 불필요한 열(시작일, 종료일) 삭제
+    drop_cols = ["실적ID", "등록여부", "선택", "시작일", "종료일"]
+    export_df = export_df.drop(columns=[c for c in drop_cols if c in export_df.columns], errors="ignore")
+
+    for date_col in ["시작일", "종료일"]:
+        if date_col in export_df.columns:
+            export_df[date_col] = (
+                pd.to_datetime(export_df[date_col], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+                .fillna("")
+            )
+
+    cols = list(export_df.columns)
+    if "사업개요" in cols and "발주처" in cols:
+        cols.remove("사업개요")
+        cols.insert(cols.index("발주처"), "사업개요")
+
+    tail_cols = ["인정률(%)", "비고", "CEMS", CERTIFICATE_STATUS_COL]
+    for col in tail_cols:
+        if col in cols:
+            cols.remove(col)
+    for col in tail_cols:
+        if col in export_df.columns:
+            cols.append(col)
+
+    export_df = export_df[cols]
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        export_df.to_excel(writer, index=False, sheet_name="유사실적")
+        worksheet = writer.sheets["유사실적"]
+
+        for idx, col_name in enumerate(export_df.columns):
+            col_letter = get_column_letter(idx + 1)
+            if export_df.empty:
+                max_len = len(str(col_name)) + 3
+            else:
+                max_len = max(export_df[col_name].astype(str).map(len).max(), len(str(col_name))) + 3
+            worksheet.column_dimensions[col_letter].width = min(max_len, 60)
+
+            for cell in worksheet[col_letter][1:]:
+                if "금액" in str(col_name):
+                    cell.number_format = "#,##0"
+                elif "건수" in str(col_name):
+                    cell.number_format = "0.00"
+
+    return output.getvalue()
+
+
+def floor_2(value):
+    return math.floor(float(value) * 100) / 100
+
+
+def normalize_col_name(name):
+    return re.sub(r"[\s_\-\[\]\(\)]", "", str(name)).lower()
+
+
+def find_column(df, candidates):
+    norm_map = {normalize_col_name(col): col for col in df.columns}
+    for candidate in candidates:
+        matched = norm_map.get(normalize_col_name(candidate))
+        if matched:
+            return matched
+    return None
+
+
+def has_value(value):
+    if value is None:
+        return False
+    if isinstance(value, float) and pd.isna(value):
+        return False
+    return str(value).strip() != ""
+
+
+def coerce_amount_series(series):
+    """콤마/문자가 섞인 금액 문자열을 float 숫자로 강제 변환."""
+    cleaned = (
+        series.astype(str)
+        .str.replace(",", "", regex=False)
+        .str.replace(r"[^\d.\-]", "", regex=True)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
+
+
+def won_to_eok(amount_won):
+    return float(amount_won) / WON_PER_EOK
+
+
+def to_number(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return 0.0
+    cleaned = re.sub(r"[,\s원건회억]", "", text)
+    match = re.search(r"-?\d+(?:\.\d+)?", cleaned)
+    if not match:
+        return 0.0
+    return float(match.group())
+
+
+def to_datetime(value):
+    if not has_value(value):
+        return pd.NaT
+    return pd.to_datetime(value, errors="coerce")
+
+
+def parse_pipe_numbers(value):
+    if not has_value(value):
+        return []
+    text = str(value).replace("/", "|").replace(",", "|")
+    return [to_number(piece) for piece in text.split("|") if has_value(piece)]
+
+
+def classify_orderer(orderer_text):
+    text = str(orderer_text or "").strip()
+    if not text:
+        return "기타"
+    if any(keyword in text for keyword in ["국토부", "환경부", "청", "사무소"]):
+        return "국가기관"
+    if any(keyword in text for keyword in ["특별시", "광역시", "자치시", "시청", "도청", "군청", "구청", "사업소"]):
+        return "지방자치단체"
+    if text.endswith(("시", "도", "군", "구")):
+        return "지방자치단체"
+    if any(keyword in text for keyword in ["공사", "공단"]):
+        return "공공기관"
+    return "기타"
+
+
+def get_base_category(text):
+    """괄호 앞 텍스트만 추출하는 결정론적 매칭 (예: 하천(기본계획) -> 하천)."""
+    return str(text).split("(")[0].strip()
+
+
+def find_date_column_indices_from_header_rows(raw_df, max_scan_rows=3):
+    """상위 N개 행에서 '시작일'/'종료일' 텍스트가 있는 열 인덱스를 탐색."""
+    start_idx = None
+    end_idx = None
+    for row_i in range(min(max_scan_rows, len(raw_df))):
+        for col_i, val in enumerate(raw_df.iloc[row_i].tolist()):
+            norm = str(val).replace(" ", "")
+            if not norm:
+                continue
+            if start_idx is None and ("시작일" in norm or "착수일" in norm):
+                start_idx = col_i
+            if end_idx is None and ("종료일" in norm or "준공일" in norm):
+                end_idx = col_i
+    return start_idx, end_idx
+
+
+def apply_date_column_rename(df, start_idx, end_idx):
+    """열 인덱스 기반으로 시작일/종료일 컬럼명을 강제 지정."""
+    cols = list(df.columns)
+    rename_map = {}
+    if start_idx is not None and start_idx < len(cols):
+        rename_map[cols[start_idx]] = "시작일"
+    if end_idx is not None and end_idx < len(cols) and end_idx != start_idx:
+        rename_map[cols[end_idx]] = "종료일"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def fallback_rename_date_pattern_columns(df):
+    """헤더 탐색 실패 시 데이터 패턴 기반으로 시작일/종료일 추정."""
+    normalized_cols = [normalize_col_name(col) for col in df.columns]
+    has_start_col = any("시작일" in col or "착수일" in col for col in normalized_cols)
+    has_end_col = any("종료일" in col or "준공일" in col for col in normalized_cols)
+    if has_start_col and has_end_col:
+        return df
+
+    date_like_cols = []
+    date_pattern = re.compile(r"^\d{4}[-./]\d{1,2}[-./]\d{1,2}$")
+    for col in df.columns:
+        series = df[col].astype(str).str.strip()
+        sample = series[series != ""].head(30)
+        if sample.empty:
+            continue
+        match_ratio = sample.apply(lambda x: bool(date_pattern.match(x))).mean()
+        if match_ratio >= 0.5:
+            date_like_cols.append(col)
+
+    if len(date_like_cols) >= 2:
+        rename_map = {}
+        if not has_start_col:
+            rename_map[date_like_cols[0]] = "시작일"
+        if not has_end_col:
+            second_col = date_like_cols[1] if date_like_cols[1] != date_like_cols[0] else date_like_cols[-1]
+            rename_map[second_col] = "종료일"
+        df = df.rename(columns=rename_map)
+    return df
+
+
+def extract_dataframe(raw_data, patch_multi_header_dates=False):
+    raw_df = pd.DataFrame(raw_data)
+    if raw_df.empty:
+        return raw_df
+
+    start_idx, end_idx = (None, None)
+    if patch_multi_header_dates:
+        start_idx, end_idx = find_date_column_indices_from_header_rows(raw_df, max_scan_rows=3)
+
+    header_idx = 0
+    for i, row in raw_df.iterrows():
+        row_text = "".join(str(val).replace(" ", "") for val in row.values)
+        if any(keyword in row_text for keyword in ["공종", "발주처", "지자체"]):
+            header_idx = i
+            break
+
+    df = raw_df.iloc[header_idx + 1 :].copy()
+    df.columns = [str(col).strip() for col in raw_df.iloc[header_idx].tolist()]
+    df = df.reset_index(drop=True)
+
+    if patch_multi_header_dates:
+        df = apply_date_column_rename(df, start_idx, end_idx)
+    df = fallback_rename_date_pattern_columns(df)
+    return df
+
+
+@st.cache_data(show_spinner=False, ttl=600)
+def load_sheet_data():
+    if not os.path.exists(SECRETS_PATH):
+        raise FileNotFoundError(f"'{SECRETS_PATH}' 파일을 찾을 수 없습니다. 현재 폴더에 파일을 배치하세요.")
+
+    credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    company_raw = spreadsheet.worksheet(COMPANY_SHEET_NAME).get_all_values()
+    criteria_raw = spreadsheet.worksheet(CRITERIA_SHEET_NAME).get_all_values()
+    return extract_dataframe(company_raw, patch_multi_header_dates=True), extract_dataframe(criteria_raw)
+
+
+CRITERIA_REQUEST_HEADERS = [
+    "요청일시",
+    "발주처",
+    "사업구분",
+    "공종",
+    "세부평가기준",
+    "건수 배점",
+    "건수 허들",
+    "금액 배점",
+    "금액 허들",
+    "비고 및 요청자",
+]
+
+
+def append_criteria_request_to_sheet(row_data):
+    """신규 세부평가기준 요청 행을 구글 스프레드시트에 추가. 시트 없으면 자동 생성."""
+    if not os.path.exists(SECRETS_PATH):
+        raise FileNotFoundError(f"'{SECRETS_PATH}' 파일을 찾을 수 없습니다. 현재 폴더에 파일을 배치하세요.")
+
+    credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    try:
+        worksheet = spreadsheet.worksheet(REQUEST_SHEET_NAME)
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=REQUEST_SHEET_NAME, rows=1000, cols=15)
+        worksheet.append_row(CRITERIA_REQUEST_HEADERS)
+
+    payload = [datetime.now().strftime("%Y-%m-%d %H:%M:%S")] + list(row_data)
+    worksheet.append_row(payload)
+
+
+def append_performance_requests_to_sheet(request_df, requester_name):
+    """다중 실적 행을 구글 스프레드시트에 일괄 추가. 시트 없으면 자동 생성."""
+    if not os.path.exists(SECRETS_PATH):
+        raise FileNotFoundError("secrets.json 누락")
+    credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+    client = gspread.authorize(credentials)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
+
+    try:
+        worksheet = spreadsheet.worksheet(PERFORMANCE_REQUEST_SHEET_NAME)
+    except WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=PERFORMANCE_REQUEST_SHEET_NAME, rows=1000, cols=20)
+        worksheet.append_row(["요청일시", "요청자"] + PERFORMANCE_HEADERS)
+
+    safe_df = request_df.fillna("").astype(str)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows_to_insert = [[timestamp, requester_name] + row for row in safe_df.values.tolist()]
+
+    if rows_to_insert:
+        worksheet.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
+
+
+def prepare_company_dataframe(company_df):
+    company = company_df.copy()
+    orderer_col = find_column(company, ["발주처", "발주기관", "기관명"])
+    biz_col = find_column(company, ["사업구분", "용역구분", "설계/감리", "구분"])
+    work_type_col = find_column(company, ["공종", "분야", "업종"])
+    total_amount_col = find_column(company, ["준공금액", "총금액", "전체금액", "계약금액", "금액", "실적금액"])
+    share_amount_col = find_column(company, ["지분금액", "지분", "참여금액"])
+    count_col = find_column(company, ["건수", "실적건수"])
+    project_col = find_column(company, ["사업명", "용역명", "공사명", "프로젝트명"])
+    overview_col = find_column(company, ["사업개요", "개요"])
+    remarks_col = find_column(company, ["비고"])
+    cems_col = find_column(company, ["CEMS", "cems"])
+    certificate_col = find_column(company, ["실적증명서 발급여부", "실적증명서발급여부"])
+    weight_col = find_column(company, ["가중치", "인정비율", "비율"])
+
+    if orderer_col is None or work_type_col is None:
+        raise ValueError("회사실적 시트에서 '발주처' 또는 '공종' 컬럼을 찾지 못했습니다.")
+
+    company["실적ID"] = range(1, len(company) + 1)
+    company["발주처_유형"] = company[orderer_col].apply(classify_orderer)
+    company["발주처"] = company[orderer_col].astype(str).str.strip()
+    company["사업구분"] = company[biz_col].astype(str).str.strip() if biz_col else ""
+    company["공종"] = company[work_type_col].astype(str).str.strip()
+    company["공종_원본"] = company["공종"]
+    company["사업명"] = (
+        company[project_col].astype(str).str.strip() if project_col else company["공종"]
+    )
+    if overview_col:
+        company["사업개요"] = company[overview_col].astype(str).str.strip()
+    else:
+        company["사업개요"] = ""
+    if remarks_col:
+        company["비고"] = company[remarks_col].astype(str).str.strip()
+    else:
+        company["비고"] = ""
+    if cems_col:
+        company["CEMS"] = company[cems_col].astype(str).str.strip()
+    else:
+        company["CEMS"] = ""
+    if total_amount_col:
+        company["준공금액"] = coerce_amount_series(company[total_amount_col])
+    else:
+        company["준공금액"] = 0.0
+    if share_amount_col:
+        company["지분금액"] = coerce_amount_series(company[share_amount_col])
+    else:
+        company["지분금액"] = company["준공금액"]
+    company["건수"] = pd.to_numeric(company[count_col].apply(to_number), errors="coerce").fillna(0.0) if count_col else 1.0
+
+    # [1] 백엔드 연산용 (시작일/종료일): 반드시 datetime으로 파싱 (기존 로직 유지, 에러 없음)
+    calc_start_col = find_column(company, ["시작일"])
+    calc_end_col = find_column(company, ["종료일"])
+    company["시작일"] = company[calc_start_col].apply(to_datetime) if calc_start_col else pd.NaT
+    company["종료일"] = company[calc_end_col].apply(to_datetime) if calc_end_col else pd.NaT
+
+    # [2] 프론트엔드 표출용 (착수일/준공일): 줄바꿈(\n)을 " / "로 치환해 단일 셀 표출
+    disp_start_col = find_column(company, ["착수일"])
+    disp_end_col = find_column(company, ["준공일"])
+    company["착수일"] = (
+        company[disp_start_col]
+        .astype(str)
+        .str.strip()
+        .replace(["nan", "None", "NaT"], "")
+        .str.replace(r"\r?\n", " / ", regex=True)
+        if disp_start_col
+        else ""
+    )
+    company["준공일"] = (
+        company[disp_end_col]
+        .astype(str)
+        .str.strip()
+        .replace(["nan", "None", "NaT"], "")
+        .str.replace(r"\r?\n", " / ", regex=True)
+        if disp_end_col
+        else ""
+    )
+
+    # [3] Vectorized Fallback: 표출용 텍스트가 비어있으면, 연산용 날짜를 YYYY-MM-DD 문자열로 변환하여 채움 (빈 값 에러 원천 차단)
+    fmt_start = company["시작일"].dt.strftime("%Y-%m-%d").fillna("")
+    fmt_end = company["종료일"].dt.strftime("%Y-%m-%d").fillna("")
+    company["착수일"] = company["착수일"].where(company["착수일"] != "", fmt_start)
+    company["준공일"] = company["준공일"].where(company["준공일"] != "", fmt_end)
+    # 표출용 데이터: 대시를 점으로 치환하여 YYYY.MM.DD 형식 강제 고정
+    company["착수일"] = company["착수일"].astype(str).str.replace("-", ".", regex=False)
+    company["준공일"] = company["준공일"].astype(str).str.replace("-", ".", regex=False)
+
+    company["선택"] = True
+    company["선택"] = company["선택"].astype(bool)
+    if weight_col:
+        def _parse_weight(x):
+            val = str(x).strip()
+            if not val or val.lower() in ["nan", "none", "nat"]:
+                return 100.0
+            m = re.search(r"-?\d+(?:\.\d+)?", val)
+            return float(m.group()) if m else 100.0
+        company["인정률(%)"] = company[weight_col].apply(_parse_weight)
+    else:
+        company["인정률(%)"] = 100.0
+
+    if certificate_col:
+        company["실적증명서 발급여부"] = company[certificate_col].astype(str).str.strip()
+    else:
+        company["실적증명서 발급여부"] = ""
+
+    return company.copy()
+
+
+def get_criteria_columns(criteria_df):
+    return {
+        "owner": find_column(criteria_df, ["발주처", "평가발주처", "지자체", "평가기관"]),
+        "work_type": find_column(criteria_df, ["공종", "분야", "업종"]),
+        "detail": find_column(criteria_df, ["세부평가기준(내용)", "세부평가기준", "내용", "평가기준", "기준내용"]),
+        "biz_type": find_column(criteria_df, ["사업구분", "평가구분", "구분"]),
+        "design_count_hurdle": find_column(criteria_df, ["[설계]건수_허들", "설계건수허들", "설계_건수_허들"]),
+        "design_count_score": find_column(criteria_df, ["[설계]건수_배점", "설계건수배점", "설계_건수_배점"]),
+        "design_amount_hurdle": find_column(criteria_df, ["[설계]금액_허들", "설계금액허들", "설계_금액_허들"]),
+        "design_amount_score": find_column(criteria_df, ["[설계]금액_배점", "설계금액배점", "설계_금액_배점"]),
+        "supervision_hurdle": find_column(criteria_df, ["[감리]공사규모별_허들", "감리공사규모별허들", "[감리]금액_허들", "감리허들"]),
+        "supervision_score": find_column(criteria_df, ["[감리]공사규모별_배점", "감리공사규모별배점", "[감리]금액_배점", "감리배점"]),
+    }
+
+
+def build_criteria_navigation_view(criteria_df, columns):
+    """역추적 결과용 핵심 이정표 컬럼만 추출."""
+    owner_col = columns["owner"]
+    biz_col = columns["biz_type"]
+    work_type_col = columns["work_type"]
+    detail_col = columns["detail"]
+
+    view = pd.DataFrame(index=criteria_df.index)
+    view["발주처"] = (
+        criteria_df[owner_col].astype(str).str.strip() if owner_col else ""
+    )
+    view["사업구분"] = (
+        criteria_df[biz_col].astype(str).str.strip() if biz_col else ""
+    )
+    view["공종"] = (
+        criteria_df[work_type_col].astype(str).str.strip() if work_type_col else ""
+    )
+    view["세부평가기준"] = (
+        criteria_df[detail_col].astype(str).str.strip() if detail_col else ""
+    )
+    return view
+
+
+def filter_criteria_master_by_business_type(criteria_df, columns, business_type):
+    """역추적 검색용 — 전체 마스터에서 현재 사업구분(설계/감리)만 1차 추출."""
+    criteria = criteria_df.copy()
+    biz_col = columns["biz_type"]
+    if biz_col:
+        criteria[biz_col] = criteria[biz_col].astype(str).str.strip()
+        return criteria[criteria[biz_col] == business_type].copy()
+
+    if business_type == "설계":
+        masks = []
+        if columns["design_count_hurdle"]:
+            masks.append(criteria[columns["design_count_hurdle"]].apply(has_value))
+        if columns["design_amount_hurdle"]:
+            masks.append(criteria[columns["design_amount_hurdle"]].apply(has_value))
+        if masks:
+            combined = masks[0]
+            for mask in masks[1:]:
+                combined = combined | mask
+            return criteria[combined].copy()
+        return criteria.iloc[0:0].copy()
+
+    if columns["supervision_hurdle"]:
+        return criteria[criteria[columns["supervision_hurdle"]].apply(has_value)].copy()
+    return criteria.iloc[0:0].copy()
+
+
+def highlight_and_preserve(text, criteria_keyword):
+    """원문 전체 표출 + 키워드 시각적 앵커 (【 ★ 키워드 ★ 】)."""
+    if pd.isna(text):
+        return text
+
+    keyword = str(criteria_keyword or "").strip()
+    if not keyword:
+        return str(text)
+
+    text_str = str(text)
+    pattern = re.compile(f"({re.escape(keyword)})", re.IGNORECASE)
+    highlight_replacement = r"【 ★ \1 ★ 】"
+    return pattern.sub(highlight_replacement, text_str)
+
+
+def render_criteria_reverse_tracking_hub(criteria_df, columns, business_type):
+    with st.expander("🔍 세부평가기준 역추적 검색 (유사 공고 찾기)"):
+        criteria_keyword = st.text_input(
+            "새로운 공고의 특이 기준이나 키워드를 입력하세요 (예: 지방도, 하수처리장, 지방하천 등)"
+        )
+
+        if not columns["detail"]:
+            st.warning("세부평가기준 시트에서 평가기준 텍스트 컬럼을 찾지 못했습니다.")
+            return
+
+        scoped_criteria = filter_criteria_master_by_business_type(criteria_df, columns, business_type)
+        search_df = build_criteria_navigation_view(scoped_criteria, columns)
+
+        keyword = str(criteria_keyword or "").strip()
+        if not keyword:
+            st.caption(
+                f"키워드를 입력하면 현재 사업구분({business_type})에 해당하는 "
+                "발주처·공종 마스터에서 유사한 세부평가기준을 검색합니다."
+            )
+            return
+
+        mask = search_df["세부평가기준"].astype(str).str.contains(keyword, case=False, na=False)
+        result_df = search_df[mask].copy()
+        if result_df.empty:
+            st.info("일치하는 세부평가기준이 없습니다. 다른 키워드로 다시 검색해 보세요.")
+            return
+
+        result_df["세부평가기준"] = result_df["세부평가기준"].apply(
+            lambda text: highlight_and_preserve(text, keyword)
+        )
+        display_df = result_df[["발주처", "세부평가기준"]]
+        st.caption(
+            f"[{business_type}] 총 {len(display_df)}건 — "
+            "키워드는 【 ★ … ★ 】 로 강조되며 세부평가기준 원문 전체가 표시됩니다. "
+            "좌측 사이드바에서 발주처·공종을 선택해 장바구니를 벤치마킹하세요."
+        )
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "발주처": st.column_config.TextColumn("발주처", width=80),
+                "세부평가기준": st.column_config.TextColumn("세부평가기준", width=1200),
+            },
+        )
+
+
+def filter_criteria_for_target(criteria_df, columns, target_owner, business_type):
+    criteria = criteria_df.copy()
+    owner_col = columns["owner"]
+    work_type_col = columns["work_type"]
+
+    if owner_col is None or work_type_col is None:
+        raise ValueError("세부평가기준 시트에서 '발주처' 또는 '공종' 컬럼을 찾지 못했습니다.")
+
+    criteria[owner_col] = criteria[owner_col].astype(str).str.strip()
+    criteria[work_type_col] = criteria[work_type_col].astype(str).str.strip()
+    criteria = criteria[criteria[owner_col] == target_owner].copy()
+    criteria = criteria[criteria[work_type_col] != ""].copy()
+
+    biz_col = columns["biz_type"]
+    if biz_col:
+        criteria[biz_col] = criteria[biz_col].astype(str).str.strip()
+        criteria = criteria[criteria[biz_col] == business_type]
+    elif business_type == "설계":
+        masks = []
+        if columns["design_count_hurdle"]:
+            masks.append(criteria[columns["design_count_hurdle"]].apply(has_value))
+        if columns["design_amount_hurdle"]:
+            masks.append(criteria[columns["design_amount_hurdle"]].apply(has_value))
+        if masks:
+            combined = masks[0]
+            for mask in masks[1:]:
+                combined = combined | mask
+            criteria = criteria[combined].copy()
+        else:
+            criteria = criteria.iloc[0:0].copy()
+    else:
+        if columns["supervision_hurdle"]:
+            criteria = criteria[criteria[columns["supervision_hurdle"]].apply(has_value)].copy()
+        else:
+            criteria = criteria.iloc[0:0].copy()
+
+    return criteria
+
+
+def recognition_window_days(recognition_years):
+    """윤년 배제: N년 = N * 365일 절대 산술."""
+    return int(recognition_years) * 365
+
+
+def filter_company_for_work_type(
+    company_df,
+    selected_work_type,
+    business_type,
+    base_date,
+    recognition_years,
+    amount_filter_col,
+    min_amount_eok,
+    apply_amount_filter=True,
+):
+    """
+    데이터 격리 절대 락(Lock):
+    1) 사업구분 == selected_biz_type
+    2) 공종 == get_base_category(selected_work_type)
+    3) 종료일이 공고일 - (N*365일) 이전이면 제외 (종료일 NaT 진행중 건은 유지)
+    4) 선택 금액 컬럼이 (N억 * 1억원) 미만이면 제외
+    """
+    match_base = get_base_category(selected_work_type)
+    lock_mask = (company_df["사업구분"].astype(str).str.strip() == str(business_type).strip()) & (
+        company_df["공종"].astype(str).str.strip() == match_base
+    )
+    filtered = company_df.loc[lock_mask].copy()
+
+    window_days = recognition_window_days(recognition_years)
+    cutoff_date = pd.Timestamp(base_date) - timedelta(days=window_days)
+    end_dates = pd.to_datetime(filtered["종료일"], errors="coerce")
+    ongoing_mask = end_dates.isna()
+    within_period_mask = end_dates >= cutoff_date
+    period_mask = ongoing_mask | within_period_mask
+
+    if not apply_amount_filter:
+        return filtered.loc[period_mask].copy()
+
+    min_amount_won = float(min_amount_eok) * WON_PER_EOK
+    amount_values = pd.to_numeric(filtered[amount_filter_col], errors="coerce").fillna(0.0)
+    amount_mask = amount_values >= min_amount_won
+
+    return filtered.loc[period_mask & amount_mask].copy()
+
+
+def get_criteria_row(criteria_target, columns, selected_work_type):
+    work_type_col = columns["work_type"]
+    matched = criteria_target[criteria_target[work_type_col].astype(str).str.strip() == str(selected_work_type).strip()]
+    if matched.empty:
+        return None
+    return matched.iloc[0]
+
+
+def pad_lists(*lists):
+    max_len = max((len(lst) for lst in lists if lst), default=0)
+    if max_len == 0:
+        return lists
+    padded = []
+    for lst in lists:
+        if not lst:
+            padded.append([""] * max_len)
+        elif len(lst) < max_len:
+            padded.append(lst + [""] * (max_len - len(lst)))
+        else:
+            padded.append(lst[:max_len])
+    return padded
+
+
+def build_design_breakdown_table(criteria_row, columns):
+    count_hurdles = parse_pipe_numbers(criteria_row.get(columns["design_count_hurdle"], ""))
+    count_scores = parse_pipe_numbers(criteria_row.get(columns["design_count_score"], ""))
+    amount_hurdles = parse_pipe_numbers(criteria_row.get(columns["design_amount_hurdle"], ""))
+    amount_scores = parse_pipe_numbers(criteria_row.get(columns["design_amount_score"], ""))
+
+    count_hurdles, count_scores, amount_hurdles, amount_scores = pad_lists(
+        count_hurdles, count_scores, amount_hurdles, amount_scores
+    )
+    max_len = max(len(count_hurdles), len(amount_hurdles), 1)
+
+    rows = []
+    for i in range(max_len):
+        rows.append(
+            {
+                "건수": count_hurdles[i] if i < len(count_hurdles) else "",
+                "건수배점": count_scores[i] if i < len(count_scores) else "",
+                "금액": amount_hurdles[i] if i < len(amount_hurdles) else "",
+                "금액배점": amount_scores[i] if i < len(amount_scores) else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_supervision_breakdown_table(criteria_row, columns):
+    hurdles = parse_pipe_numbers(criteria_row.get(columns["supervision_hurdle"], ""))
+    scores = parse_pipe_numbers(criteria_row.get(columns["supervision_score"], ""))
+    hurdles, scores = pad_lists(hurdles, scores)
+    max_len = max(len(hurdles), 1)
+
+    rows = []
+    for i in range(max_len):
+        rows.append(
+            {
+                "건수": "",
+                "건수배점": "",
+                "금액": hurdles[i] if i < len(hurdles) else "",
+                "금액배점": scores[i] if i < len(scores) else "",
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def evaluate_score(actual_value, hurdle_value, score_value):
+    hurdles = parse_pipe_numbers(hurdle_value)
+    scores = parse_pipe_numbers(score_value)
+    if not hurdles or not scores:
+        return 0.0
+
+    pairs = sorted(zip(hurdles, scores), key=lambda x: x[0], reverse=True)
+    if actual_value <= 0:
+        return 0.0
+
+    for hurdle, score in pairs:
+        if actual_value >= hurdle:
+            return float(score)
+    return 0.0
+
+
+def compute_overlap_days(start_date, end_date, base_date, recognition_years):
+    if pd.isna(start_date) or pd.isna(end_date):
+        return 0
+
+    start_date = pd.Timestamp(start_date)
+    end_date = pd.Timestamp(end_date)
+    base_date = pd.Timestamp(base_date)
+
+    if end_date < start_date:
+        start_date, end_date = end_date, start_date
+
+    window_days = recognition_window_days(recognition_years)
+    window_start = base_date - timedelta(days=window_days)
+    overlap_start = max(start_date, window_start)
+    overlap_end = min(end_date, base_date)
+
+    if overlap_end < overlap_start:
+        return 0
+    return int((overlap_end - overlap_start).days + 1)
+
+
+def cast_numeric_columns(df):
+    """st.data_editor 반환값을 집계 가능한 float으로 강제 변환."""
+    out = df.copy()
+    if "건수" in out.columns:
+        out["건수"] = pd.to_numeric(out["건수"], errors="coerce").fillna(0.0)
+    if "인정률(%)" in out.columns:
+        out["인정률(%)"] = pd.to_numeric(out["인정률(%)"], errors="coerce").fillna(0.0)
+    if "등록여부" in out.columns:
+        out["등록여부"] = out["등록여부"].fillna(False).astype(bool)
+    if "선택" in out.columns:
+        out["선택"] = out["선택"].fillna(False).astype(bool)
+    for amount_col in ["준공금액", "지분금액"]:
+        if amount_col in out.columns:
+            out[amount_col] = coerce_amount_series(out[amount_col])
+    return out
+
+
+CERTIFICATE_STATUS_COL = "실적증명서 발급여부"
+
+EDITOR_COLUMN_ORDER = [
+    "선택",
+    "사업명",
+    "발주처",
+    "착수일",
+    "준공일",
+    "준공금액",
+    "지분금액",
+    "건수",
+    "인정률(%)",
+    CERTIFICATE_STATUS_COL,
+]
+EDITOR_DISABLED_COLS = ["사업명", "발주처", "착수일", "준공일", "준공금액", "지분금액", "건수"]
+EDITABLE_MERGE_COLS = ["선택", "인정률(%)", CERTIFICATE_STATUS_COL]
+
+
+def get_editor_column_config():
+    return {
+        "선택": st.column_config.CheckboxColumn("선택", default=False),
+        "준공금액": st.column_config.NumberColumn("준공금액", format="%,d"),
+        "지분금액": st.column_config.NumberColumn("지분금액", format="%,d"),
+        "인정률(%)": st.column_config.NumberColumn("인정률(%)", min_value=0, max_value=100, step=1),
+        "착수일": st.column_config.TextColumn("착수일"),
+        "준공일": st.column_config.TextColumn("준공일"),
+        CERTIFICATE_STATUS_COL: st.column_config.TextColumn(CERTIFICATE_STATUS_COL),
+    }
+
+
+def normalize_edited_slice(edited_df):
+    if edited_df is None or edited_df.empty:
+        return pd.DataFrame()
+    work = edited_df.copy()
+    if "실적ID" in work.columns:
+        work["실적ID"] = work["실적ID"].astype(str)
+        return work.set_index("실적ID")
+    work.index = work.index.astype(str)
+    work.index.name = "실적ID"
+    return work
+
+
+def ensure_editor_bool_columns(df):
+    work = df.copy()
+    if "등록여부" in work.columns:
+        work["등록여부"] = work["등록여부"].fillna(False).astype(bool)
+    if "선택" in work.columns:
+        work["선택"] = work["선택"].fillna(False).astype(bool)
+    if CERTIFICATE_STATUS_COL not in work.columns:
+        work[CERTIFICATE_STATUS_COL] = ""
+    else:
+        work[CERTIFICATE_STATUS_COL] = work[CERTIFICATE_STATUS_COL].fillna("").astype(str).str.strip()
+    for hidden_col in ["사업개요", "비고", "CEMS"]:
+        if hidden_col not in work.columns:
+            work[hidden_col] = ""
+        else:
+            work[hidden_col] = work[hidden_col].fillna("").astype(str).str.strip()
+    return work
+
+
+EDITOR_FRAME_COLS = [
+    "실적ID",
+    "등록여부",
+    "선택",
+    "사업명",
+    "사업개요",
+    "발주처",
+    "시작일",
+    "종료일",
+    "착수일",
+    "준공일",
+    "준공금액",
+    "지분금액",
+    "건수",
+    "인정률(%)",
+    "비고",
+    "CEMS",
+    CERTIFICATE_STATUS_COL,
+]
+
+
+def build_fresh_sync_frame(company_filtered):
+    """구글 시트 최신 행 + 장바구니 뼈대(등록/선택 False) — 상태 보존 병합용."""
+    data_cols = [
+        "실적ID",
+        "사업명",
+        "사업개요",
+        "발주처",
+        "시작일",
+        "종료일",
+        "착수일",
+        "준공일",
+        "준공금액",
+        "지분금액",
+        "건수",
+        "인정률(%)",
+        "비고",
+        "CEMS",
+        CERTIFICATE_STATUS_COL,
+    ]
+    frame = company_filtered[data_cols].copy()
+    for text_col in ["사업개요", "비고", "CEMS", CERTIFICATE_STATUS_COL]:
+        frame[text_col] = frame[text_col].fillna("").astype(str).str.strip()
+    frame["등록여부"] = False
+    frame["선택"] = False
+    frame["등록여부"] = frame["등록여부"].astype(bool)
+    frame["선택"] = frame["선택"].astype(bool)
+    return frame[EDITOR_FRAME_COLS]
+
+
+def merge_preserved_portfolio_state(fresh_df, saved_df):
+    """실적ID 기준으로 장바구니(등록여부)·인정률만 최신 시트 뼈대에 복원."""
+    fresh = fresh_df.copy()
+    fresh["실적ID"] = fresh["실적ID"].astype(str)
+    saved = ensure_editor_bool_columns(saved_df.copy())
+    saved["실적ID"] = saved["실적ID"].astype(str)
+
+    fresh_indexed = fresh.set_index("실적ID")
+    saved_indexed = saved.set_index("실적ID")
+    preserve_cols = [col for col in PORTFOLIO_PRESERVE_COLS if col in saved_indexed.columns]
+    if preserve_cols:
+        patch = saved_indexed[preserve_cols].copy()
+        if "등록여부" in patch.columns:
+            patch["등록여부"] = patch["등록여부"].fillna(False).astype(bool)
+        if "인정률(%)" in patch.columns:
+            patch["인정률(%)"] = pd.to_numeric(patch["인정률(%)"], errors="coerce")
+        fresh_indexed.update(patch)
+
+    return ensure_editor_bool_columns(fresh_indexed.reset_index())
+
+
+def save_portfolio_snapshot(state_key):
+    st.session_state["portfolio_memory"][state_key] = st.session_state["editor_df"].copy()
+    save_portfolio_memory()
+    st.toast("✅ 현재 구성이 안전하게 저장되었습니다.")
+
+
+def parse_portfolio_state_key(state_key):
+    parts = str(state_key).split("|")
+    if len(parts) != 4:
+        return None
+    return {
+        "owner": parts[0],
+        "business_type": parts[1],
+        "selected_work_type": parts[2],
+        "match_base_category": parts[3],
+    }
+
+
+def find_cross_load_candidates(portfolio_memory, target_owner, business_type, match_base_category):
+    candidates = []
+    for key in portfolio_memory:
+        parsed = parse_portfolio_state_key(key)
+        if parsed is None:
+            continue
+        if parsed["business_type"] != business_type:
+            continue
+        if parsed["match_base_category"] != match_base_category:
+            continue
+        if parsed["owner"] == target_owner:
+            continue
+
+        saved_df = ensure_editor_bool_columns(portfolio_memory[key].copy())
+        if not (saved_df["등록여부"] == True).any():
+            continue
+
+        candidates.append(
+            {
+                "key": key,
+                "owner": parsed["owner"],
+                "selected_work_type": parsed["selected_work_type"],
+                "label": f"[{parsed['owner']}] - {parsed['selected_work_type']}",
+            }
+        )
+
+    return sorted(candidates, key=lambda item: item["label"])
+
+
+def apply_cross_load_portfolio(source_df):
+    """다른 발주처 포트폴리오의 등록 실적(실적ID·인정률)을 현재 editor_df에 병합."""
+    source = ensure_editor_bool_columns(source_df.copy())
+    registered_rows = source[source["등록여부"] == True].copy()
+    if registered_rows.empty:
+        return False
+
+    merged = merge_preserved_portfolio_state(st.session_state["editor_df"], registered_rows)
+    merged = append_filter_excluded_registrations(merged, registered_rows)
+    st.session_state["editor_df"] = ensure_editor_bool_columns(merged)
+    return True
+
+
+PORTFOLIO_PRESERVE_COLS = ["등록여부", "인정률(%)"]
+POOL_OMNI_SEARCH_COLS = ["사업명", "발주처", "사업개요", "비고"]
+
+
+def filter_pool_by_search_keyword(pool_df, search_keyword):
+    """Table B 통합 검색 — 키워드가 없으면 전체 Pool 반환."""
+    table_b_df = pool_df.copy()
+    keyword = str(search_keyword or "").strip()
+    if not keyword:
+        return table_b_df
+
+    for col in POOL_OMNI_SEARCH_COLS:
+        if col not in table_b_df.columns:
+            table_b_df[col] = ""
+
+    mask = pd.Series(False, index=table_b_df.index)
+    for col in POOL_OMNI_SEARCH_COLS:
+        mask |= table_b_df[col].astype(str).str.contains(keyword, case=False, na=False)
+    return table_b_df[mask]
+
+
+def pool_visible_selection_mask(editor_df, search_keyword, filter_scope_ids=None):
+    """Pool 행 중 현재 필터·검색 뷰에 표출된 행만 선택 토글 대상으로 지정."""
+    work = ensure_editor_bool_columns(editor_df)
+    work["실적ID"] = work["실적ID"].astype(str)
+    pool_mask = work["등록여부"].fillna(False).astype(bool) == False
+    if filter_scope_ids is not None:
+        pool_mask = pool_mask & work["실적ID"].isin(filter_scope_ids)
+
+    keyword = str(search_keyword or "").strip()
+    if not keyword:
+        return pool_mask
+
+    search_mask = pd.Series(False, index=work.index)
+    for col in POOL_OMNI_SEARCH_COLS:
+        if col not in work.columns:
+            work[col] = ""
+        search_mask |= work[col].astype(str).str.contains(keyword, case=False, na=False)
+    return pool_mask & search_mask
+
+
+def toggle_selection_by_mask(editor_df, row_mask):
+    """표출 범위(row_mask) 내 선택 컬럼을 스마트 토글(전부 True면 False, 아니면 True)."""
+    work = ensure_editor_bool_columns(editor_df)
+    if not row_mask.any():
+        return work
+    scoped = work.loc[row_mask, "선택"]
+    work.loc[row_mask, "선택"] = False if scoped.all() else True
+    return work
+
+
+def apply_partial_editor_updates(*edited_slices):
+    """선택/인정률(%)만 실적ID(str) 기준으로 session editor_df에 부분 갱신."""
+    if not edited_slices:
+        return
+
+    base = st.session_state["editor_df"]
+    base["실적ID"] = base["실적ID"].astype(str)
+    base_indexed = base.set_index("실적ID")
+
+    for edited in edited_slices:
+        slice_indexed = normalize_edited_slice(edited)
+        if slice_indexed.empty:
+            continue
+        update_cols = [col for col in EDITABLE_MERGE_COLS if col in slice_indexed.columns]
+        if not update_cols:
+            continue
+        patch = slice_indexed[update_cols].copy()
+        if "선택" in patch.columns:
+            patch["선택"] = patch["선택"].fillna(False).astype(bool)
+        if "인정률(%)" in patch.columns:
+            patch["인정률(%)"] = pd.to_numeric(patch["인정률(%)"], errors="coerce")
+        base_indexed.update(patch)
+
+    refreshed = base_indexed.reset_index().set_index("실적ID")
+    session_df = st.session_state["editor_df"]
+    session_df["실적ID"] = session_df["실적ID"].astype(str)
+    for col in EDITABLE_MERGE_COLS:
+        if col in refreshed.columns:
+            session_df[col] = session_df["실적ID"].map(refreshed[col])
+
+
+def register_selected_pool_rows(editor_df):
+    work = ensure_editor_bool_columns(editor_df)
+    promote_mask = (work["등록여부"] == False) & (work["선택"] == True)
+    work.loc[promote_mask, "등록여부"] = True
+    work.loc[promote_mask, "선택"] = False
+    return work
+
+
+def unregister_selected_target_rows(editor_df):
+    work = ensure_editor_bool_columns(editor_df)
+    demote_mask = (work["등록여부"] == True) & (work["선택"] == True)
+    work.loc[demote_mask, "등록여부"] = False
+    work.loc[demote_mask, "선택"] = False
+    return work
+
+
+def merge_editor_updates(base_df, *edited_slices):
+    """실적ID(str) 인덱스 기준으로 선택/인정률(%)만 병합(계산·버튼용, session 덮어쓰기 금지)."""
+    merged = ensure_editor_bool_columns(base_df.copy())
+    merged["실적ID"] = merged["실적ID"].astype(str)
+    base_indexed = merged.set_index("실적ID")
+
+    for edited in edited_slices:
+        slice_indexed = normalize_edited_slice(edited)
+        if slice_indexed.empty:
+            continue
+        update_cols = [col for col in EDITABLE_MERGE_COLS if col in slice_indexed.columns]
+        if not update_cols:
+            continue
+        patch = slice_indexed[update_cols].copy()
+        if "선택" in patch.columns:
+            patch["선택"] = patch["선택"].fillna(False).astype(bool)
+        if "인정률(%)" in patch.columns:
+            patch["인정률(%)"] = pd.to_numeric(patch["인정률(%)"], errors="coerce")
+        base_indexed.update(patch)
+
+    return base_indexed.reset_index()
+
+
+def render_performance_editor(source_df, editor_key):
+    view_df = source_df.copy()
+    for amount_col in ["준공금액", "지분금액"]:
+        if amount_col in view_df.columns:
+            view_df[amount_col] = pd.to_numeric(view_df[amount_col], errors="coerce").fillna(0.0)
+
+    if "실적ID" in view_df.columns:
+        view_df["실적ID"] = view_df["실적ID"].astype(str)
+        view_df = view_df.set_index("실적ID")
+
+    edited = st.data_editor(
+        view_df,
+        use_container_width=True,
+        num_rows="fixed",
+        hide_index=True,
+        column_order=EDITOR_COLUMN_ORDER,
+        column_config=get_editor_column_config(),
+        disabled=EDITOR_DISABLED_COLS,
+        key=editor_key,
+    )
+
+    if edited.index.name == "실적ID" or edited.index.name is None:
+        return edited.reset_index(names="실적ID")
+    return edited
+
+
+def resolve_preserved_editor_source(state_key):
+    """등록 상태 복원용 — 동일 화면이면 세션 editor_df 우선, 없으면 portfolio."""
+    if st.session_state.get("current_state_key") == state_key and "editor_df" in st.session_state:
+        return st.session_state["editor_df"].copy()
+
+    portfolio = st.session_state["portfolio_memory"]
+    if state_key in portfolio:
+        return portfolio[state_key].copy()
+
+    if st.session_state.get("force_sync") and "editor_df" in st.session_state:
+        return st.session_state["editor_df"].copy()
+
+    return None
+
+
+def append_filter_excluded_registrations(visible_df, saved_df):
+    """필터 밖으로 나간 등록 실적을 세션에서 유지(메모리 증발 방지)."""
+    if saved_df is None or saved_df.empty:
+        return visible_df
+
+    visible = ensure_editor_bool_columns(visible_df.copy())
+    saved = ensure_editor_bool_columns(saved_df.copy())
+    visible["실적ID"] = visible["실적ID"].astype(str)
+    saved["실적ID"] = saved["실적ID"].astype(str)
+
+    visible_ids = set(visible["실적ID"].tolist())
+    missing_saved = saved[~saved["실적ID"].isin(visible_ids)].copy()
+    missing_saved = missing_saved[missing_saved["등록여부"] == True]
+    if missing_saved.empty:
+        return visible
+
+    return pd.concat([visible, missing_saved], ignore_index=True)
+
+
+def sync_editor_state(state_key, company_filtered):
+    """최신 시트 뼈대 + 보존된 등록 상태 병합. portfolio는 💾 저장 시에만 갱신."""
+    fresh_df = build_fresh_sync_frame(company_filtered)
+    saved_df = resolve_preserved_editor_source(state_key)
+
+    if saved_df is not None:
+        merged_df = merge_preserved_portfolio_state(fresh_df, saved_df)
+        merged_df = append_filter_excluded_registrations(merged_df, saved_df)
+    else:
+        merged_df = fresh_df
+
+    st.session_state["editor_df"] = ensure_editor_bool_columns(merged_df)
+    return st.session_state["editor_df"]
+
+
+def render_dual_metric_html(confirmed_text, all_text):
+    return (
+        f'<div style="line-height:1.25;">'
+        f'<div style="font-size:1.55rem; font-weight:600;">{confirmed_text}</div>'
+        f'<div style="font-size:0.8em; color: gray;">({all_text})</div>'
+        f"</div>"
+    )
+
+
+def render_dual_metric_cell(label, confirmed_text, all_text):
+    st.markdown(f"**{label}**")
+    st.markdown(render_dual_metric_html(confirmed_text, all_text), unsafe_allow_html=True)
+
+
+def render_design_scoreboard(
+    verified_count,
+    verified_amount_won,
+    verified_count_score,
+    verified_amount_score,
+    all_count,
+    all_amount_won,
+    all_count_score,
+    all_amount_score,
+):
+    verified_final = verified_count_score + verified_amount_score
+    all_final = all_count_score + all_amount_score
+
+    verified_count_text = f"{floor_2(verified_count):.2f}건"
+    all_count_text = f"{floor_2(all_count):.2f}건"
+    verified_amount_text = f"{floor_2(won_to_eok(verified_amount_won)):.2f}억"
+    all_amount_text = f"{floor_2(won_to_eok(all_amount_won)):.2f}억"
+    verified_count_score_text = f"{floor_2(verified_count_score):.2f}점"
+    all_count_score_text = f"{floor_2(all_count_score):.2f}점"
+    verified_amount_score_text = f"{floor_2(verified_amount_score):.2f}점"
+    all_amount_score_text = f"{floor_2(all_amount_score):.2f}점"
+    verified_final_text = f"{floor_2(verified_final):.2f}점"
+    all_final_text = f"{floor_2(all_final):.2f}점"
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        render_dual_metric_cell("인정건수", verified_count_text, all_count_text)
+    with c2:
+        render_dual_metric_cell("인정금액", verified_amount_text, all_amount_text)
+    with c3:
+        render_dual_metric_cell("건수 점수", verified_count_score_text, all_count_score_text)
+    with c4:
+        render_dual_metric_cell("금액 점수", verified_amount_score_text, all_amount_score_text)
+    with c5:
+        render_dual_metric_cell("최종 총점", verified_final_text, all_final_text)
+
+
+def render_supervision_scoreboard(converted_amount_won, amount_score):
+    amount_eok_display = floor_2(won_to_eok(converted_amount_won))
+    c1, c2 = st.columns(2)
+    c1.metric("최종 환산 실적 금액", f"{amount_eok_display:.2f}억")
+    c2.metric("배점표 점수", f"{floor_2(amount_score):.2f}점")
+
+
+def format_criteria_detail_markdown(raw_text):
+    """세부평가기준 원문을 마크다운 가독성 형태로 정돈."""
+    text = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+
+    # ※는 문장 중간이어도 반드시 앞에서 단락 분리(빈 줄) 후 별도 블록으로 처리
+    text = re.sub(r"\s*※", "\n\n※", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = text.strip()
+
+    # 기타 글머리 기호 앞에도 강제 단락 분리
+    text = re.sub(r"(?<!\n)\s*◦", "\n\n◦", text)
+    text = re.sub(r"(?<!\n)\s*•", "\n\n•", text)
+    text = re.sub(r"(?<!\n)\s*·", "\n\n·", text)
+
+    bullet_prefixes = ("◦", "•", "-", "–", "—", "·")
+    formatted_lines = []
+    note_block_parts = []
+
+    def flush_note_block():
+        if not note_block_parts:
+            return
+        body = " ".join(part.strip() for part in note_block_parts if part.strip())
+        note_line = f"**※ {body}**" if body else "**※**"
+        if formatted_lines and formatted_lines[-1] != "":
+            formatted_lines.append("")
+        formatted_lines.append(note_line)
+        formatted_lines.append("")
+        note_block_parts.clear()
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        if stripped.startswith("※"):
+            flush_note_block()
+            note_block_parts.append(stripped.lstrip("※").strip())
+        elif stripped.startswith(bullet_prefixes):
+            flush_note_block()
+            body = stripped[1:].strip()
+            formatted_lines.append(f"- {body}")
+        elif note_block_parts:
+            note_block_parts.append(stripped)
+        else:
+            formatted_lines.append(stripped)
+
+    flush_note_block()
+
+    blocks = []
+    current = []
+    for line in formatted_lines:
+        if line == "":
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+
+    return "\n\n".join(blocks)
+
+
+def render_criteria_detail(raw_text):
+    markdown_text = format_criteria_detail_markdown(raw_text)
+    if not markdown_text:
+        st.info("세부평가기준(내용) 컬럼이 없거나 비어 있습니다.")
+        return
+    with st.container(border=True):
+        st.markdown(markdown_text)
+
+
+def filter_aggregate_source_df(edited_df, business_type):
+    """Table A(등록) 또는 선택 행만 집계 대상으로 필터."""
+    df = cast_numeric_columns(edited_df.copy())
+    if business_type == "설계":
+        if "등록여부" in df.columns:
+            df["등록여부"] = df["등록여부"].fillna(False).astype(bool)
+            df = df[df["등록여부"] == True].copy()
+    elif "선택" in df.columns:
+        df["선택"] = df["선택"].fillna(True).astype(bool)
+        df = df[df["선택"] == True].copy()
+    return df
+
+
+def is_certificate_verified(df):
+    if CERTIFICATE_STATUS_COL not in df.columns:
+        return pd.Series(False, index=df.index)
+    return df[CERTIFICATE_STATUS_COL].astype(str).str.upper().str.strip() == "O"
+
+
+def compute_design_recognition_totals(df):
+    if df.empty:
+        return 0.0, 0.0
+    rate = df["인정률(%)"] / 100.0
+    total_count = float((df["건수"] * rate).sum())
+    total_amount_won = float((df["지분금액"] * rate).sum())
+    return total_count, total_amount_won
+
+
+def compute_supervision_recognition_total(df, base_date, recognition_years):
+    if df.empty:
+        return 0.0
+
+    work = cast_numeric_columns(df.copy())
+    if "시작일" in work.columns:
+        work["시작일"] = pd.to_datetime(work["시작일"], errors="coerce")
+    if "종료일" in work.columns:
+        work["종료일"] = pd.to_datetime(work["종료일"], errors="coerce")
+
+    window_days = recognition_window_days(recognition_years)
+    recognized_amounts = []
+    for _, row in work.iterrows():
+        overlap_days = compute_overlap_days(
+            row["시작일"], row["종료일"], base_date, recognition_years
+        )
+        share_amount = float(row["지분금액"])
+        rate = float(row["인정률(%)"]) / 100.0
+        recognized = (overlap_days / window_days) * share_amount * rate
+        recognized_amounts.append(recognized)
+
+    return float(sum(recognized_amounts))
+
+
+def aggregate_recognition_totals(edited_df, business_type, base_date, recognition_years):
+    """(확정건수, 확정금액, 전체건수, 전체금액) 반환 — 확정은 발급여부 'O'만."""
+    df = filter_aggregate_source_df(edited_df, business_type)
+    verified_df = df[is_certificate_verified(df)].copy()
+
+    if business_type == "설계":
+        all_count, all_amount = compute_design_recognition_totals(df)
+        verified_count, verified_amount = compute_design_recognition_totals(verified_df)
+        return verified_count, verified_amount, all_count, all_amount
+
+    all_amount = compute_supervision_recognition_total(df, base_date, recognition_years)
+    verified_amount = compute_supervision_recognition_total(verified_df, base_date, recognition_years)
+    return 0.0, verified_amount, 0.0, all_amount
+
+
+def render_scorecard_block(
+    scorecard_placeholder,
+    business_type,
+    criteria_row,
+    columns,
+    verified_count,
+    verified_amount_won,
+    all_count,
+    all_amount_won,
+):
+    verified_amount_eok = won_to_eok(verified_amount_won)
+    all_amount_eok = won_to_eok(all_amount_won)
+
+    with scorecard_placeholder.container():
+        if business_type == "설계":
+            verified_count_score = evaluate_score(
+                verified_count,
+                criteria_row.get(columns["design_count_hurdle"], ""),
+                criteria_row.get(columns["design_count_score"], ""),
+            )
+            all_count_score = evaluate_score(
+                all_count,
+                criteria_row.get(columns["design_count_hurdle"], ""),
+                criteria_row.get(columns["design_count_score"], ""),
+            )
+            verified_amount_score = evaluate_score(
+                verified_amount_eok,
+                criteria_row.get(columns["design_amount_hurdle"], ""),
+                criteria_row.get(columns["design_amount_score"], ""),
+            )
+            all_amount_score = evaluate_score(
+                all_amount_eok,
+                criteria_row.get(columns["design_amount_hurdle"], ""),
+                criteria_row.get(columns["design_amount_score"], ""),
+            )
+            max_count = parse_pipe_numbers(criteria_row.get(columns["design_count_hurdle"], ""))
+            max_amount = parse_pipe_numbers(criteria_row.get(columns["design_amount_hurdle"], ""))
+            title_count = max(max_count) if max_count else 0
+            title_amount = max(max_amount) if max_amount else 0
+            st.subheader(f"당사 유사실적 (만점기준: {title_count:g}건 / {title_amount:g}억원)")
+            render_design_scoreboard(
+                verified_count,
+                verified_amount_won,
+                verified_count_score,
+                verified_amount_score,
+                all_count,
+                all_amount_won,
+                all_count_score,
+                all_amount_score,
+            )
+        else:
+            verified_amount_score = evaluate_score(
+                verified_amount_eok,
+                criteria_row.get(columns["supervision_hurdle"], ""),
+                criteria_row.get(columns["supervision_score"], ""),
+            )
+            all_amount_score = evaluate_score(
+                all_amount_eok,
+                criteria_row.get(columns["supervision_hurdle"], ""),
+                criteria_row.get(columns["supervision_score"], ""),
+            )
+            max_amount = parse_pipe_numbers(criteria_row.get(columns["supervision_hurdle"], ""))
+            title_amount = max(max_amount) if max_amount else 0
+            st.subheader(f"당사 유사실적 (만점기준: 0건 / {title_amount:g}억원)")
+            render_design_scoreboard(
+                0.0,
+                verified_amount_won,
+                0.0,
+                verified_amount_score,
+                0.0,
+                all_amount_won,
+                0.0,
+                all_amount_score,
+            )
+
+        st.caption("※ 괄호 ( ) 안의 수치는 실적증명서 미발급건을 모두 포함한 수치입니다.")
+
+
+def build_corporate_summary(
+    company,
+    criteria_df,
+    columns,
+    owners,
+    business_type,
+    base_date,
+    recognition_years,
+    amount_filter_col,
+    min_amount_eok,
+):
+    """전체 발주처 × 공종 조합의 달성률·수치를 집계한 DataFrame을 반환."""
+    portfolio = st.session_state.get("portfolio_memory", {})
+    work_type_col = columns["work_type"]
+
+    rows = []
+    for owner in owners:
+        criteria_target = filter_criteria_for_target(criteria_df, columns, owner, business_type)
+        work_types = sorted(
+            criteria_target[work_type_col].astype(str).str.strip().unique().tolist()
+        )
+        for wt in work_types:
+            criteria_row = get_criteria_row(criteria_target, columns, wt)
+            if criteria_row is None:
+                continue
+
+            match_base = get_base_category(wt)
+            state_key = f"{owner}|{business_type}|{wt}|{match_base}"
+
+            company_filtered = filter_company_for_work_type(
+                company, wt, business_type, base_date,
+                recognition_years, amount_filter_col, min_amount_eok,
+            )
+
+            if state_key in portfolio:
+                editor_df = ensure_editor_bool_columns(portfolio[state_key].copy())
+            else:
+                editor_df = ensure_editor_bool_columns(build_fresh_sync_frame(company_filtered))
+
+            company_date_filtered = filter_company_for_work_type(
+                company, wt, business_type, base_date,
+                recognition_years, amount_filter_col, min_amount_eok,
+                apply_amount_filter=False,
+            )
+            date_scope_ids = set(company_date_filtered["실적ID"].astype(str))
+
+            editor_df["실적ID"] = editor_df["실적ID"].astype(str)
+            editor_df = editor_df[editor_df["실적ID"].isin(date_scope_ids)].copy()
+
+            verified_count, verified_amount_won, _, _ = aggregate_recognition_totals(
+                editor_df, business_type, base_date, recognition_years
+            )
+            verified_amount_eok = won_to_eok(verified_amount_won)
+
+            if business_type == "설계":
+                our_score = evaluate_score(
+                    verified_count,
+                    criteria_row.get(columns["design_count_hurdle"], ""),
+                    criteria_row.get(columns["design_count_score"], ""),
+                ) + evaluate_score(
+                    verified_amount_eok,
+                    criteria_row.get(columns["design_amount_hurdle"], ""),
+                    criteria_row.get(columns["design_amount_score"], ""),
+                )
+                max_count_nums = parse_pipe_numbers(criteria_row.get(columns["design_count_hurdle"], ""))
+                max_amount_nums = parse_pipe_numbers(criteria_row.get(columns["design_amount_hurdle"], ""))
+                max_count_scores = parse_pipe_numbers(criteria_row.get(columns["design_count_score"], ""))
+                max_amount_scores = parse_pipe_numbers(criteria_row.get(columns["design_amount_score"], ""))
+                max_score = (max(max_count_scores) if max_count_scores else 0.0) + (
+                    max(max_amount_scores) if max_amount_scores else 0.0
+                )
+                max_count = max(max_count_nums) if max_count_nums else 0
+                max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
+            else:
+                our_score = evaluate_score(
+                    verified_amount_eok,
+                    criteria_row.get(columns["supervision_hurdle"], ""),
+                    criteria_row.get(columns["supervision_score"], ""),
+                )
+                max_amount_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_hurdle"], ""))
+                max_scores_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_score"], ""))
+                max_score = max(max_scores_nums) if max_scores_nums else 0.0
+                max_count = 0
+                max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
+                verified_count = 0.0
+
+            achievement = (our_score / max_score * 100.0) if max_score > 0 else 0.0
+
+            rows.append(
+                {
+                    "발주처": owner,
+                    "공종": wt,
+                    "당사건수": floor_2(verified_count),
+                    "당사금액억": floor_2(verified_amount_eok),
+                    "만점건수": max_count,
+                    "만점금액억": max_amount_eok_val,
+                    "당사점수": floor_2(our_score),
+                    "만점점수": floor_2(max_score),
+                    "달성률": floor_2(min(achievement, 100.0)),
+                }
+            )
+
+    return pd.DataFrame(rows)
+
+
+DASHBOARD_ALL_OPTION = "전체 (All)"
+
+
+def navigate_to_detail(selected_target):
+    if selected_target:
+        owner, wt = [x.strip() for x in selected_target.split("|")]
+        st.session_state["app_mode"] = "🔍 개별 발주처 조회"
+        st.session_state["sidebar_owner"] = owner
+        st.session_state["jump_target_work_type"] = wt
+        st.session_state["force_sync"] = True
+
+
+def render_corporate_dashboard(
+    company,
+    criteria_df,
+    columns,
+    target_owner,
+    owners,
+    business_type,
+    base_date,
+    recognition_years,
+    amount_filter_col,
+    min_amount_eok,
+):
+    effective_owners = (
+        [o for o in owners if o != DASHBOARD_ALL_OPTION]
+        if target_owner == DASHBOARD_ALL_OPTION
+        else [target_owner]
+    )
+
+    with st.spinner("집계 중..."):
+        summary_df = build_corporate_summary(
+            company, criteria_df, columns, effective_owners, business_type,
+            base_date, recognition_years, amount_filter_col, min_amount_eok,
+        )
+
+    if summary_df.empty:
+        st.info("집계 가능한 데이터가 없습니다.")
+        return
+
+    def _status(row):
+        count_ok = (row["만점건수"] <= 0) or (row["당사건수"] >= row["만점건수"])
+        amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
+        return "✅ 달성" if (count_ok and amount_ok) else "🚨 미달"
+
+    flat_df = pd.DataFrame(
+        {
+            "발주처": summary_df["발주처"],
+            "공종": summary_df["공종"],
+            "당사 실적": summary_df.apply(
+                lambda r: f"{r['당사건수']:.2f}건 / {r['당사금액억']:.2f}억", axis=1
+            ),
+            "만점 기준": summary_df.apply(
+                lambda r: f"{int(r['만점건수'])}건 / {r['만점금액억']:.0f}억", axis=1
+            ),
+            "상태": summary_df.apply(_status, axis=1),
+        }
+    )
+    excel_data = convert_df_to_excel(flat_df)
+
+    # Step A: 헤더
+    st.subheader("📊 총괄표")
+
+    # Step B: 상단 네비게이션 (세부실적 이동)
+    st.markdown("**🔗 세부실적 상세조회 화면으로 이동**")
+    nav_options = [
+        f"{row['발주처']} | {row['공종']}"
+        for _, row in flat_df.iterrows()
+    ]
+    nav_col1, nav_col2 = st.columns([8, 2])
+    with nav_col1:
+        selected_nav = st.selectbox(
+            "세부실적 이동",
+            nav_options,
+            label_visibility="collapsed",
+            key="corporate_nav_select",
+        )
+    with nav_col2:
+        st.button(
+            "세부실적 바로가기",
+            use_container_width=True,
+            key="corporate_nav_go",
+            on_click=navigate_to_detail,
+            args=(selected_nav,),
+        )
+    st.markdown("<hr style='margin-top: 5px; margin-bottom: 10px;'/>", unsafe_allow_html=True)
+
+    # Step C: 총괄표 렌더링
+    st.dataframe(
+        flat_df,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "발주처": st.column_config.TextColumn("발주처", width="medium"),
+            "공종": st.column_config.TextColumn("공종", width="large"),
+            "당사 실적": st.column_config.TextColumn("당사 실적", width="medium"),
+            "만점 기준": st.column_config.TextColumn("만점 기준", width="medium"),
+            "상태": st.column_config.TextColumn("상태", width="small"),
+        },
+    )
+
+    # Step D: 좌측 주석 + 우측 엑셀 다운로드
+    footer_col, excel_btn_col = st.columns([8, 2])
+    with footer_col:
+        st.caption("※ 당사 실적은 세부실적 List에 직접 등록(저장)한 항목만 집계됩니다.")
+    with excel_btn_col:
+        st.download_button(
+            label="📗 엑셀 다운로드",
+            data=excel_data,
+            file_name=f"전사총괄대시보드_{business_type}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    st.divider()
+    st.subheader("신규 세부평가기준 등록요청")
+    st.caption("제출된 신규 세부평가기준은 검토를 거쳐 2~3일내로 반영됩니다.")
+
+    owner_options = [
+        "경기도",
+        "경상남도",
+        "경상북도",
+        "광주광역시",
+        "대구광역시",
+        "대전광역시",
+        "부산광역시",
+        "서울특별시",
+        "인천광역시",
+        "전라남도",
+        "전북특별자치도",
+        "충청남도",
+        "충청북도",
+        "제주특별자치도",
+    ]
+    work_major_options = [
+        "교통",
+        "도로",
+        "도시개발",
+        "도시계획",
+        "도시공원",
+        "상하수도",
+        "하천",
+        "항만",
+        "산림",
+        "철도",
+        "조경",
+        "방재",
+        "환경",
+    ]
+    score_placeholder = "예: 6, 5.4, 4.8 (쉼표로 구분)"
+
+    with st.form("criteria_request_form", clear_on_submit=True):
+        row1_col1, row1_col2 = st.columns(2)
+        with row1_col1:
+            req_owner = st.selectbox("발주처", owner_options)
+        with row1_col2:
+            req_biz_type = st.selectbox("사업 구분", ["설계", "감리"])
+
+        row2_col1, row2_col2 = st.columns(2)
+        with row2_col1:
+            req_work_major = st.selectbox("공종 대구분", work_major_options)
+        with row2_col2:
+            req_work_minor = st.text_input(
+                "공종 소구분",
+                placeholder="예: 지방도, 하수관로, 지방하천 등",
+            )
+
+        req_detail = st.text_area("세부평가기준 내용")
+
+        score_col1, score_col2, score_col3, score_col4 = st.columns(4)
+        with score_col1:
+            req_count_score = st.text_input("건수 배점", placeholder=score_placeholder)
+        with score_col2:
+            req_count_hurdle = st.text_input("건수 허들", placeholder=score_placeholder)
+        with score_col3:
+            req_amount_score = st.text_input("금액 배점", placeholder=score_placeholder)
+        with score_col4:
+            req_amount_hurdle = st.text_input("금액 허들", placeholder=score_placeholder)
+
+        req_requester = st.text_input("요청자 정보")
+
+        submitted = st.form_submit_button("신규 세부평가기준 제출", type="primary")
+        if submitted:
+            work_minor = req_work_minor.strip()
+            merged_work_type = (
+                f"{req_work_major}({work_minor})" if work_minor else req_work_major.strip()
+            )
+
+            def normalize_score_input(value):
+                return str(value).strip().replace(" ", "").replace(",", "|")
+
+            row_data = [
+                req_owner.strip(),
+                req_biz_type.strip(),
+                merged_work_type,
+                req_detail.strip(),
+                normalize_score_input(req_count_score),
+                normalize_score_input(req_count_hurdle),
+                normalize_score_input(req_amount_score),
+                normalize_score_input(req_amount_hurdle),
+                req_requester.strip(),
+            ]
+            try:
+                append_criteria_request_to_sheet(row_data)
+                st.success("성공적으로 요청되었습니다.")
+            except Exception as e:
+                st.error("요청 전송 중 오류가 발생했습니다.")
+                st.exception(e)
+
+
+def main():
+    st.set_page_config(page_title="회사 유사실적 조회 시스템", layout="wide")
+
+    load_portfolio_memory()
+
+    title_col, refresh_col = st.columns([8, 2])
+    with title_col:
+        st.title("회사 유사실적 조회 시스템")
+    with refresh_col:
+        st.write("")
+        if st.button("🔄 데이터 최신화", use_container_width=True):
+            load_sheet_data.clear()
+            st.session_state["force_sync"] = True
+            st.rerun()
+
+    try:
+        company_df, criteria_df = load_sheet_data()
+        company = prepare_company_dataframe(company_df)
+        columns = get_criteria_columns(criteria_df)
+    except Exception as e:
+        st.error("데이터 로딩/전처리 중 오류가 발생했습니다.")
+        st.exception(e)
+        return
+
+    owner_col = columns["owner"]
+    work_type_col = columns["work_type"]
+    if owner_col is None or work_type_col is None:
+        st.error("세부평가기준 시트에서 필수 컬럼을 찾지 못했습니다.")
+        return
+
+    owners = sorted(criteria_df[owner_col].astype(str).str.strip().replace("", pd.NA).dropna().unique().tolist())
+    if not owners:
+        st.error("세부평가기준 시트에 선택 가능한 발주처가 없습니다.")
+        return
+
+    owners_with_all = [DASHBOARD_ALL_OPTION] + owners
+
+    # ── 모드 선택 ──────────────────────────────────────────────────────────────
+    mode = st.sidebar.radio(
+        "모드",
+        ["📊 회사 유사실적 총괄표", "🔍 개별 발주처 조회", "📋 공종별 실적조회"],
+        label_visibility="collapsed",
+        key="app_mode",
+    )
+    st.sidebar.markdown(SIDEBAR_SLIM_DIVIDER, unsafe_allow_html=True)
+
+    # ── 발주처 선택 ────────────────────────────────────────────────────────────
+    st.sidebar.header("🏢 발주처 선택")
+    target_owner = st.sidebar.selectbox(
+        "발주처 선택",
+        owners_with_all,
+        index=0,
+        key="sidebar_owner",
+    )
+    st.sidebar.markdown(SIDEBAR_SLIM_DIVIDER, unsafe_allow_html=True)
+
+    # ── 공통 설정 (두 모드 모두 사용) ────────────────────────────────────────
+    st.sidebar.header("⚙️ 조회 설정")
+    business_type = st.sidebar.radio("사업 구분", ["설계", "감리"], horizontal=True)
+
+    if mode == "🔍 개별 발주처 조회":
+        render_criteria_reverse_tracking_hub(criteria_df, columns, business_type)
+
+    announce_date = pd.Timestamp(st.sidebar.date_input("공고일", value=pd.Timestamp.today().date()))
+    base_date = announce_date  # 기존 백엔드 함수 호환성을 위해 유지
+
+    if business_type == "감리":
+        # PQ 역산법: 공고일 기준 -3년 + 1일 (이 값이 윈도우의 '시작일'이 됨)
+        default_window_start = (announce_date - pd.DateOffset(years=3) + pd.DateOffset(days=1)).date()
+        window_start_date = pd.Timestamp(st.sidebar.date_input("기준공고일", value=default_window_start))
+
+    default_recognition_years = 5 if business_type == "설계" else 3
+    recognition_years = int(
+        st.sidebar.number_input(
+            "실적인정 기간 (단위: 년)",
+            min_value=1,
+            max_value=30,
+            value=default_recognition_years,
+            step=1,
+        )
+    )
+    st.sidebar.caption(f"※ 적용: {recognition_years}년 ({recognition_window_days(recognition_years)}일 = {recognition_years} × 365일)")
+
+    if business_type == "설계":
+        amount_filter_col = st.sidebar.radio("금액 필터 기준", ["준공금액", "지분금액"], index=0, horizontal=True)
+        min_amount_eok = float(
+            st.sidebar.number_input(
+                "인정기준금액 (N억 이상)",
+                min_value=0.0,
+                value=1.0,
+                step=0.1,
+                format="%.1f",
+            )
+        )
+    else:
+        amount_filter_col = "지분금액"
+        min_amount_eok = 0.0
+
+    work_major_options = [
+        "교통", "도로", "도시개발", "도시계획", "도시공원", "상하수도",
+        "하천", "항만", "산림", "철도", "조경", "방재", "환경",
+    ]
+    perf_column_config = {
+        "공종": st.column_config.SelectboxColumn("공종", options=work_major_options),
+        "사 업 명": st.column_config.TextColumn("사 업 명", width=350),
+        "사업개요": st.column_config.TextColumn("사업개요", width="medium"),
+        "발 주 처": st.column_config.TextColumn("발 주 처", width=120),
+        "비고": st.column_config.TextColumn("비고", width="medium"),
+    }
+
+    # ── 공종별 실적조회 ───────────────────────────────────────────────────────
+    if mode == "📋 공종별 실적조회":
+        st.subheader("📋 공종별 실적조회")
+
+        search_col1, search_col2 = st.columns([1, 1])
+        with search_col1:
+            search_work_type = st.selectbox("📁 공종 검색", ["전체"] + work_major_options)
+        with search_col2:
+            search_perf = st.text_input("🔍 실적 검색 (사업명, 발주처 등 통합 검색)")
+
+        # 사이드바 필터 동기화 (사업구분 일치 및 공고일 기준 N년 이내)
+        window_days = recognition_window_days(recognition_years)
+        cutoff_date = pd.Timestamp(base_date) - timedelta(days=window_days)
+        end_dates = pd.to_datetime(company_df["종료일"], errors="coerce")
+
+        period_mask = end_dates.isna() | (end_dates >= cutoff_date)
+        biz_mask = company_df["사업구분"].astype(str).str.strip() == business_type
+
+        filtered_company = company_df[period_mask & biz_mask].copy()
+
+        view_df = pd.DataFrame()
+        for col_name in PERFORMANCE_HEADERS:
+            actual_col = find_column(filtered_company, [col_name])
+            if actual_col:
+                view_df[col_name] = filtered_company[actual_col]
+            else:
+                view_df[col_name] = ""
+
+        if search_work_type != "전체":
+            view_df = view_df[
+                view_df["공종"].astype(str).str.replace(" ", "") == search_work_type
+            ]
+        if search_perf:
+            mask = pd.Series(False, index=view_df.index)
+            for col in view_df.columns:
+                mask |= view_df[col].astype(str).str.contains(search_perf, case=False, na=False)
+            view_df = view_df[mask]
+
+        if business_type == "설계":
+            display_cols = ["사 업 명", "사업개요", "발 주 처", "시작일", "종료일", "준공금액", "지분금액", "건수", "가중치", "비고"]
+            dynamic_config = perf_column_config
+        else:
+            display_cols = ["사 업 명", "사업개요", "발 주 처", "용역기간", "지분금액(A)", "인정기간", "기간비율(B)", "인정률(C)", "적용금액", "비고"]
+
+            calc_view = view_df.copy()
+            calc_view["시작일_dt"] = pd.to_datetime(calc_view["시작일"], errors="coerce")
+            calc_view["종료일_dt"] = pd.to_datetime(calc_view["종료일"], errors="coerce")
+
+            period_texts = []
+            rec_period_texts = []
+            ratio_texts = []
+            applied_amounts = []
+            rec_rates = []
+
+            for _, row in calc_view.iterrows():
+                start_dt = row["시작일_dt"]
+                end_dt = row["종료일_dt"]
+
+                # 지분금액(A) 파싱 (콤마 제거 후 안전하게 변환)
+                raw_share = str(row["지분금액"]).replace(",", "")
+                share_amt = pd.to_numeric(raw_share, errors="coerce")
+                if pd.isna(share_amt):
+                    share_amt = 0.0
+
+                rec_rate_val = 100.0
+                if "인정률(%)" in calc_view.columns and pd.notna(row["인정률(%)"]):
+                    rec_rate_val = float(row["인정률(%)"])
+
+                if pd.isna(start_dt) or pd.isna(end_dt):
+                    period_texts.append("-")
+                    rec_period_texts.append("-")
+                    ratio_texts.append("-")
+                    rec_rates.append(f"{rec_rate_val}%")
+                    applied_amounts.append(0)
+                    continue
+
+                # 1. 용역기간 (전체일수 천 단위 콤마)
+                total_days = int((end_dt - start_dt).days + 1)
+                str_start = start_dt.strftime("%Y.%m.%d")
+                str_end = end_dt.strftime("%Y.%m.%d")
+                period_texts.append(f"{str_start} ~ {str_end} ({total_days:,}일)")
+
+                # 2. 인정기간 계산 (정밀 연산 유지)
+                overlap_start = max(start_dt, window_start_date)
+                overlap_end = min(end_dt, announce_date)
+
+                if overlap_end < overlap_start:
+                    rec_days = 0
+                    rec_period_texts.append("-")
+                    exact_ratio = 0.0
+                    truncated_ratio = 0.0
+                else:
+                    rec_days = int((overlap_end - overlap_start).days + 1)
+                    str_o_start = overlap_start.strftime("%Y.%m.%d")
+                    str_o_end = overlap_end.strftime("%Y.%m.%d")
+                    rec_period_texts.append(f"{str_o_start} ~ {str_o_end} ({rec_days:,}일)")
+                    exact_ratio = rec_days / total_days if total_days > 0 else 0.0
+                    # 실무자 기준: 소수점 4자리 미만 절사 (엑셀 ROUNDDOWN 동일)
+                    truncated_ratio = math.floor(exact_ratio * 10000) / 10000.0
+
+                # 3. 기간비율 및 인정률 (절사된 비율 적용)
+                ratio_texts.append(f"{truncated_ratio * 100:.2f}%")
+                rec_rates.append(f"{rec_rate_val}%")
+
+                # 4. 적용금액 산출: A(지분금액) * B(절사된 비율) * C(인정률)
+                applied_amt = share_amt * truncated_ratio * (rec_rate_val / 100.0)
+                applied_amounts.append(applied_amt)
+
+            # View에 컬럼 맵핑
+            view_df["용역기간"] = period_texts
+            view_df["지분금액(A)"] = calc_view["지분금액"]
+            view_df["인정기간"] = rec_period_texts
+            view_df["기간비율(B)"] = ratio_texts
+            view_df["인정률(C)"] = rec_rates
+            view_df["적용금액"] = applied_amounts
+
+            dynamic_config = {
+                "사 업 명": st.column_config.TextColumn("사 업 명", width=250),
+                "사업개요": st.column_config.TextColumn("사업개요", width="medium"),
+                "발 주 처": st.column_config.TextColumn("발 주 처", width=120),
+                "용역기간": st.column_config.TextColumn("용역기간", width=200),
+                "지분금액(A)": st.column_config.NumberColumn("지분금액(A)", format="%,.0f", width=120),
+                "인정기간": st.column_config.TextColumn("인정기간", width=200),
+                "기간비율(B)": st.column_config.TextColumn("기간비율(B)", width=100),
+                "인정률(C)": st.column_config.TextColumn("인정률(C)", width=90),
+                "적용금액": st.column_config.NumberColumn("적용금액", format="%,.0f", width=120),
+                "비고": st.column_config.TextColumn("비고", width="medium"),
+            }
+
+        st.dataframe(
+            view_df[display_cols],
+            use_container_width=True,
+            hide_index=True,
+            height=400,
+            column_config=dynamic_config,
+        )
+
+        st.divider()
+        st.subheader("업데이트 실적 일괄 등록요청 (Excel 연동)")
+        st.caption("※ 엑셀 파일에서 등록할 행을 드래그하여 복사(Ctrl+C)한 뒤, 아래 표의 빈 셀을 클릭하고 붙여넣기(Ctrl+V) 하세요.")
+        st.caption(
+            "※ 공종은 지정된 표준 대분류(13종) 명칭만 입력 및 인식됩니다. "
+            "(교통, 도로, 도시개발, 도시계획, 도시공원, 상하수도, 하천, 항만, 산림, 철도, 조경, 방재, 환경)"
+        )
+
+        if "bulk_success_msg" in st.session_state:
+            st.success(st.session_state.pop("bulk_success_msg"))
+
+        if "editor_clear_key" not in st.session_state:
+            st.session_state["editor_clear_key"] = 0
+
+        template_df = pd.DataFrame(columns=PERFORMANCE_HEADERS)
+        edited_perf_df = st.data_editor(
+            template_df,
+            num_rows="dynamic",
+            use_container_width=True,
+            key=f"bulk_perf_editor_{st.session_state['editor_clear_key']}",
+            column_config=perf_column_config,
+        )
+
+        requester_name = st.text_input(
+            "👤 등록자 성함 (필수)",
+            placeholder="예: 홍길동 대리",
+            key=f"requester_name_{st.session_state['editor_clear_key']}",
+        )
+
+        if st.button("신규 실적 일괄 전송", type="primary"):
+            if not requester_name.strip():
+                st.warning("등록자 성함을 입력해주세요.")
+            else:
+                valid_rows = edited_perf_df.dropna(how="all")
+                if valid_rows.empty:
+                    st.warning("전송할 실적 데이터를 입력하거나 붙여넣어 주세요.")
+                else:
+                    try:
+                        append_performance_requests_to_sheet(valid_rows, requester_name.strip())
+                        st.session_state["bulk_success_msg"] = (
+                            f"성공적으로 {len(valid_rows)}건의 실적이 요청되었습니다."
+                        )
+                        st.session_state["editor_clear_key"] += 1
+                        st.rerun()
+                    except Exception as e:
+                        st.error("요청 전송 중 오류가 발생했습니다.")
+                        st.exception(e)
+        return
+
+    # ── 회사 유사실적 총괄표 ──────────────────────────────────────────────────
+    if mode == "📊 회사 유사실적 총괄표":
+        render_corporate_dashboard(
+            company, criteria_df, columns, target_owner, owners, business_type,
+            base_date, recognition_years, amount_filter_col, min_amount_eok,
+        )
+        return
+
+    # ── 개별 발주처 조회 ──────────────────────────────────────────────────────
+    if target_owner == DASHBOARD_ALL_OPTION:
+        st.warning("개별 발주처 조회를 위해 특정 발주처를 선택해주세요.")
+        return
+
+    criteria_target = filter_criteria_for_target(criteria_df, columns, target_owner, business_type)
+    work_types = sorted(criteria_target[work_type_col].astype(str).str.strip().unique().tolist())
+    if not work_types:
+        st.warning("선택한 조건에 해당하는 평가기준 공종이 없습니다.")
+        return
+
+    jump_wt = st.session_state.pop("jump_target_work_type", None)
+    if jump_wt and jump_wt in work_types:
+        selected_work_type = st.selectbox(
+            "조회할 공종 선택",
+            work_types,
+            index=work_types.index(jump_wt),
+            key="selected_work_type",
+        )
+    else:
+        selected_work_type = st.selectbox(
+            "조회할 공종 선택",
+            work_types,
+            key="selected_work_type",
+        )
+    criteria_row = get_criteria_row(criteria_target, columns, selected_work_type)
+    if criteria_row is None:
+        st.warning("선택한 공종의 평가기준을 찾을 수 없습니다.")
+        return
+
+    match_base_category = get_base_category(selected_work_type)
+    company_filtered = filter_company_for_work_type(
+        company,
+        selected_work_type,
+        business_type,
+        base_date,
+        recognition_years,
+        amount_filter_col,
+        min_amount_eok,
+    )
+    company_date_filtered = filter_company_for_work_type(
+        company,
+        selected_work_type,
+        business_type,
+        base_date,
+        recognition_years,
+        amount_filter_col,
+        min_amount_eok,
+        apply_amount_filter=False,
+    )
+    state_key = f"{target_owner}|{business_type}|{selected_work_type}|{match_base_category}"
+
+    # 금액·기간 필터는 Table A/B 표시·점수 범위만 제한(filter_scope_ids).
+    # filter 변경 시 sync_editor_state를 호출하면 좁혀진 company_filtered로
+    # editor_df가 재구성되어 등록 상태가 증발할 수 있으므로 제외한다.
+    needs_sync = (
+        st.session_state.get("current_state_key") != state_key
+        or st.session_state.get("force_sync", False)
+    )
+
+    if needs_sync:
+        sync_editor_state(state_key, company_filtered)
+        st.session_state["current_state_key"] = state_key
+        st.session_state["force_sync"] = False
+
+    left_col, right_col = st.columns(2)
+    with left_col:
+        detail_col = columns["detail"]
+        st.subheader("세부평가기준")
+        if detail_col and has_value(criteria_row.get(detail_col, "")):
+            render_criteria_detail(criteria_row.get(detail_col, ""))
+        else:
+            st.info("세부평가기준(내용) 컬럼이 없거나 비어 있습니다.")
+
+    with right_col:
+        st.subheader("해당 공종 세부 배점 기준표")
+        if business_type == "설계":
+            breakdown_df = build_design_breakdown_table(criteria_row, columns)
+            score_c1, score_c2 = st.columns(2)
+            with score_c1:
+                st.markdown("**[건수 기준]**")
+                st.dataframe(
+                    breakdown_df[["건수", "건수배점"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with score_c2:
+                st.markdown("**[금액 기준]**")
+                st.dataframe(
+                    breakdown_df[["금액", "금액배점"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            breakdown_df = build_supervision_breakdown_table(criteria_row, columns)
+            st.markdown("**[금액 기준]**")
+            st.dataframe(
+                breakdown_df[["금액", "금액배점"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    scorecard_placeholder = st.empty()
+
+    st.subheader("세부실적 List")
+    if business_type == "감리":
+        st.caption("인정률(%) 또는 선택 체크를 변경하면 상단 점수판이 즉시 재계산됩니다.")
+
+    editor_df = ensure_editor_bool_columns(st.session_state["editor_df"])
+    amount_scope_ids = set(company_filtered["실적ID"].astype(str))
+    date_scope_ids = set(company_date_filtered["실적ID"].astype(str))
+    filter_scope_ids = amount_scope_ids
+
+    def filter_editor_to_current_scope(df):
+        scoped = ensure_editor_bool_columns(df.copy())
+        scoped["실적ID"] = scoped["실적ID"].astype(str)
+        registered_mask = scoped["등록여부"].fillna(False).astype(bool) == True
+        in_date_scope = scoped["실적ID"].isin(date_scope_ids)
+        in_amount_scope = scoped["실적ID"].isin(amount_scope_ids)
+        return scoped[(registered_mask & in_date_scope) | (~registered_mask & in_amount_scope)].copy()
+
+    if business_type == "설계":
+        target_df = filter_editor_to_current_scope(editor_df[editor_df["등록여부"] == True])
+
+        title_col, empty_col, save_col, load_col = st.columns([5, 1, 1.5, 2.5])
+        with title_col:
+            st.subheader(f"🎯 {target_owner} {selected_work_type} 세부실적 List")
+        with save_col:
+            st.write("")
+            if st.button(
+                "💾 현재 포트폴리오 저장",
+                use_container_width=True,
+                key=f"save_portfolio_{state_key}",
+            ):
+                save_portfolio_snapshot(state_key)
+        cross_candidates = find_cross_load_candidates(
+            st.session_state["portfolio_memory"],
+            target_owner,
+            business_type,
+            match_base_category,
+        )
+        with load_col:
+            st.write("")
+            with st.popover(
+                "📂 타 발주처 실적 불러오기",
+                use_container_width=True,
+            ):
+                cross_labels = (
+                    [item["label"] for item in cross_candidates]
+                    if cross_candidates
+                    else ["Empty"]
+                )
+                selected_label = st.selectbox(
+                    "저장된 포트폴리오",
+                    cross_labels,
+                    key=f"cross_load_select_{state_key}",
+                )
+                is_empty_selection = selected_label == "Empty"
+                if st.button(
+                    "불러오기",
+                    use_container_width=True,
+                    disabled=is_empty_selection,
+                    key=f"cross_load_apply_{state_key}",
+                ):
+                    if is_empty_selection:
+                        st.warning("불러올 실적이 없습니다.")
+                    else:
+                        selected = next(
+                            item for item in cross_candidates if item["label"] == selected_label
+                        )
+                        source_df = st.session_state["portfolio_memory"][selected["key"]]
+                        if apply_cross_load_portfolio(source_df):
+                            st.toast(
+                                f"✅ [{selected['owner']}] 포트폴리오 실적을 불러왔습니다."
+                            )
+                            st.rerun()
+
+        edited_target = render_performance_editor(target_df, f"target_{state_key}")
+
+        table_a_df = merge_editor_updates(editor_df, edited_target)
+        table_a_df = table_a_df[table_a_df["등록여부"] == True].copy()
+
+        target_btn_col1, target_btn_col2, target_btn_col3 = st.columns(3)
+        with target_btn_col1:
+            if st.button(
+                "☑️ 전체 선택 / 전체 해제",
+                use_container_width=True,
+                key="toggle_target",
+            ):
+                apply_partial_editor_updates(edited_target)
+                scoped_editor = st.session_state["editor_df"].copy()
+                scoped_editor["실적ID"] = scoped_editor["실적ID"].astype(str)
+                target_mask = (
+                    scoped_editor["등록여부"].fillna(False).astype(bool) == True
+                ) & scoped_editor["실적ID"].isin(date_scope_ids)
+                st.session_state["editor_df"] = toggle_selection_by_mask(
+                    st.session_state["editor_df"], target_mask
+                )
+                st.rerun()
+        with target_btn_col2:
+            if st.button("⬇️ 등록 해제", use_container_width=True, key=f"unregister_{state_key}"):
+                apply_partial_editor_updates(edited_target)
+                st.session_state["editor_df"] = unregister_selected_target_rows(
+                    st.session_state["editor_df"]
+                )
+                st.rerun()
+        with target_btn_col3:
+            # 지정된 추출용 컬럼 리스트
+            export_cols = [
+                "사업명", "사업개요", "발주처", "착수일", "준공일",
+                "준공금액", "지분금액", "건수", "인정률(%)", "비고", CERTIFICATE_STATUS_COL,
+            ]
+            # 안전하게 존재하는 컬럼만 필터링하여 엑셀 변환
+            safe_export_cols = [c for c in export_cols if c in table_a_df.columns]
+            excel_data_a = convert_df_to_excel(table_a_df[safe_export_cols])
+            st.download_button(
+                label="📗 해당분야 실적 추출",
+                data=excel_data_a,
+                file_name=f"{target_owner}_유사실적.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_target_{state_key}",
+            )
+
+        st.subheader(f"📁 전체 {selected_work_type} 실적 List")
+        search_keyword = st.text_input(
+            "🔍 전체 실적 키워드 검색 (사업명, 발주처, 사업개요, 비고 등 통합 검색)",
+            key=f"search_{state_key}",
+        )
+
+        table_b_df = filter_editor_to_current_scope(
+            editor_df[editor_df["등록여부"] == False]
+        )
+        table_b_df = filter_pool_by_search_keyword(table_b_df, search_keyword)
+        pool_view_df = table_b_df.copy()
+
+        edited_pool = render_performance_editor(pool_view_df, f"pool_{state_key}")
+
+        table_b_df = merge_editor_updates(editor_df, edited_target, edited_pool)
+        table_b_df = filter_editor_to_current_scope(table_b_df[table_b_df["등록여부"] == False])
+        table_b_df = filter_pool_by_search_keyword(table_b_df, search_keyword)
+
+        pool_btn_col1, pool_btn_col2, pool_btn_col3 = st.columns(3)
+        with pool_btn_col1:
+            if st.button(
+                "☑️ 전체 선택 / 전체 해제",
+                use_container_width=True,
+                key="toggle_pool",
+            ):
+                apply_partial_editor_updates(edited_target, edited_pool)
+                visible_pool_mask = pool_visible_selection_mask(
+                    st.session_state["editor_df"], search_keyword, filter_scope_ids
+                )
+                st.session_state["editor_df"] = toggle_selection_by_mask(
+                    st.session_state["editor_df"], visible_pool_mask
+                )
+                st.rerun()
+        with pool_btn_col2:
+            if st.button("⬆️ 실적 등록", use_container_width=True, key=f"pool_register_{state_key}"):
+                apply_partial_editor_updates(edited_target, edited_pool)
+                st.session_state["editor_df"] = register_selected_pool_rows(
+                    st.session_state["editor_df"]
+                )
+                st.rerun()
+        with pool_btn_col3:
+            safe_export_cols = [c for c in export_cols if c in table_b_df.columns]
+            excel_data_b = convert_df_to_excel(table_b_df[safe_export_cols])
+            st.download_button(
+                label="📗 전체 실적 추출",
+                data=excel_data_b,
+                file_name="전체실적_데이터.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_pool_{state_key}",
+            )
+
+        calc_df = merge_editor_updates(editor_df, edited_target, edited_pool)
+        calc_df = filter_editor_to_current_scope(calc_df)
+    else:
+        edited_view = render_performance_editor(editor_df, f"pq_editor_{state_key}")
+        calc_df = edited_view
+
+    verified_count, verified_amount_won, all_count, all_amount_won = aggregate_recognition_totals(
+        calc_df, business_type, base_date, recognition_years
+    )
+    render_scorecard_block(
+        scorecard_placeholder,
+        business_type,
+        criteria_row,
+        columns,
+        verified_count,
+        verified_amount_won,
+        all_count,
+        all_amount_won,
+    )
+
+
+if __name__ == "__main__":
+    main()
