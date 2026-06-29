@@ -1,3 +1,17 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -1608,7 +1622,6 @@ def build_corporate_summary(
     recognition_years,
     amount_filter_col,
     min_amount_eok,
-    global_supervision_scale=None,
 ):
     """전체 발주처 × 공종 조합의 달성률·수치를 집계한 DataFrame을 반환."""
     portfolio = st.session_state.get("portfolio_memory", {})
@@ -1672,55 +1685,34 @@ def build_corporate_summary(
                 )
                 max_count = max(max_count_nums) if max_count_nums else 0
                 max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
-
-                achievement = (our_score / max_score * 100.0) if max_score > 0 else 0.0
-
-                rows.append(
-                    {
-                        "발주처": owner,
-                        "공종": wt,
-                        "당사건수": floor_2(verified_count),
-                        "당사금액억": floor_2(verified_amount_eok),
-                        "만점건수": max_count,
-                        "만점금액억": max_amount_eok_val,
-                        "당사점수": floor_2(our_score),
-                        "만점점수": floor_2(max_score),
-                        "달성률": floor_2(min(achievement, 100.0)),
-                    }
-                )
             else:
-                raw_text = criteria_row.get(columns["supervision_score"], "")
-                if not raw_text and columns.get("supervision_hurdle"):
-                    raw_text = criteria_row.get(columns["supervision_hurdle"], "")
-
-                parsed_scales = parse_all_supervision_scales(raw_text)
-                scale_options = list(parsed_scales.keys())
-
-                if global_supervision_scale and global_supervision_scale not in scale_options:
-                    rows.append({
-                        "발주처": owner, "공종": wt, "당사건수": 0.0, "당사금액억": floor_2(verified_amount_eok),
-                        "만점건수": 0, "만점금액억": 0, "당사점수": 0.0, "만점점수": 0.0,
-                        "달성률": 0.0, "상태코드": "기준없음"
-                    })
-                    continue
-
-                active_hurdle, active_score = parsed_scales[global_supervision_scale] if global_supervision_scale and global_supervision_scale in scale_options else parsed_scales[scale_options[0]] if scale_options else ("", "")
-                our_score = evaluate_score(verified_amount_eok, active_hurdle, active_score)
-                max_amount_nums = parse_pipe_numbers(active_hurdle)
-                max_scores_nums = parse_pipe_numbers(active_score)
-
+                our_score = evaluate_score(
+                    verified_amount_eok,
+                    criteria_row.get(columns["supervision_hurdle"], ""),
+                    criteria_row.get(columns["supervision_score"], ""),
+                )
+                max_amount_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_hurdle"], ""))
+                max_scores_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_score"], ""))
                 max_score = max(max_scores_nums) if max_scores_nums else 0.0
                 max_count = 0
                 max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
                 verified_count = 0.0
 
-                achievement = (our_score / max_score * 100.0) if max_score > 0 else 0.0
+            achievement = (our_score / max_score * 100.0) if max_score > 0 else 0.0
 
-                rows.append({
-                    "발주처": owner, "공종": wt, "당사건수": floor_2(verified_count), "당사금액억": floor_2(verified_amount_eok),
-                    "만점건수": max_count, "만점금액억": max_amount_eok_val, "당사점수": floor_2(our_score),
-                    "만점점수": floor_2(max_score), "달성률": floor_2(min(achievement, 100.0)), "상태코드": "정상"
-                })
+            rows.append(
+                {
+                    "발주처": owner,
+                    "공종": wt,
+                    "당사건수": floor_2(verified_count),
+                    "당사금액억": floor_2(verified_amount_eok),
+                    "만점건수": max_count,
+                    "만점금액억": max_amount_eok_val,
+                    "당사점수": floor_2(our_score),
+                    "만점점수": floor_2(max_score),
+                    "달성률": floor_2(min(achievement, 100.0)),
+                }
+            )
 
     return pd.DataFrame(rows)
 
@@ -1748,7 +1740,6 @@ def render_corporate_dashboard(
     recognition_years,
     amount_filter_col,
     min_amount_eok,
-    global_supervision_scale=None,
 ):
     effective_owners = (
         [o for o in owners if o != DASHBOARD_ALL_OPTION]
@@ -1760,42 +1751,27 @@ def render_corporate_dashboard(
         summary_df = build_corporate_summary(
             company, criteria_df, columns, effective_owners, business_type,
             base_date, recognition_years, amount_filter_col, min_amount_eok,
-            global_supervision_scale,
         )
 
     if summary_df.empty:
         st.info("집계 가능한 데이터가 없습니다.")
         return
 
-    if business_type == "감리" and "상태코드" in summary_df.columns:
-        missing_agencies = summary_df[summary_df["상태코드"] == "기준없음"]["발주처"].unique()
-        if len(missing_agencies) > 0:
-            st.warning(f"⚠️ 선택하신 당해공사규모에 대한 평가기준이 없는 발주처가 있습니다: {', '.join(missing_agencies)}")
-
     def _status(row):
-        if business_type == "설계":
-            count_ok = (row["만점건수"] <= 0) or (row["당사건수"] >= row["만점건수"])
-            amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
-            return "✅ 달성" if (count_ok and amount_ok) else "🚨 미달"
-        else:
-            if row.get("상태코드") == "기준없음":
-                return "⚠️ 판단불가"
-            amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
-            return "✅ 달성" if amount_ok else "🚨 미달"
-
-    if business_type == "설계":
-        perf_str = lambda r: f"{r['당사건수']:.2f}건 / {r['당사금액억']:.2f}억"
-        target_str = lambda r: f"{int(r['만점건수'])}건 / {r['만점금액억']:.0f}억"
-    else:
-        perf_str = lambda r: f"{r['당사금액억']:.2f}억"
-        target_str = lambda r: "해당규모 기준없음" if r.get("상태코드") == "기준없음" else f"{r['만점금액억']:.0f}억"
+        count_ok = (row["만점건수"] <= 0) or (row["당사건수"] >= row["만점건수"])
+        amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
+        return "✅ 달성" if (count_ok and amount_ok) else "🚨 미달"
 
     flat_df = pd.DataFrame(
         {
             "발주처": summary_df["발주처"],
             "공종": summary_df["공종"],
-            "당사 실적": summary_df.apply(perf_str, axis=1),
-            "만점 기준": summary_df.apply(target_str, axis=1),
+            "당사 실적": summary_df.apply(
+                lambda r: f"{r['당사건수']:.2f}건 / {r['당사금액억']:.2f}억", axis=1
+            ),
+            "만점 기준": summary_df.apply(
+                lambda r: f"{int(r['만점건수'])}건 / {r['만점금액억']:.0f}억", axis=1
+            ),
             "상태": summary_df.apply(_status, axis=1),
         }
     )
@@ -2010,15 +1986,6 @@ def main():
     # ── 공통 설정 (두 모드 모두 사용) ────────────────────────────────────────
     st.sidebar.header("⚙️ 조회 설정")
     business_type = st.sidebar.radio("사업 구분", ["설계", "감리"], horizontal=True)
-
-    global_supervision_scale = None
-    if business_type == "감리" and mode == "📊 회사 유사실적 총괄표":
-        global_supervision_scale = st.sidebar.selectbox(
-            "📌 당해공사규모 (총괄표 일괄적용)",
-            ["100억원 미만", "100억원 이상", "300억원 이상", "500억원 이상", "1,000억원 이상", "2,000억원 이상", "3,000억원 이상"],
-            index=1,
-            help="선택하신 기준이 특정 발주처에 없을 경우 '기준없음'으로 표시됩니다."
-        )
 
     if mode == "🔍 개별 발주처 조회":
         render_criteria_reverse_tracking_hub(criteria_df, columns, business_type)
@@ -2281,7 +2248,6 @@ def main():
         render_corporate_dashboard(
             company, criteria_df, columns, target_owner, owners, business_type,
             base_date, recognition_years, amount_filter_col, min_amount_eok,
-            global_supervision_scale,
         )
         return
 
