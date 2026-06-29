@@ -60,7 +60,7 @@ def load_portfolio_memory():
         except Exception:
             pass  # 로드 실패 시 시스템 크래시 방지
 
-def save_portfolio_memory():
+def save_portfolio_memory(target_key=None):
     try:
         try:
             credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
@@ -91,6 +91,10 @@ def save_portfolio_memory():
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         for key, df in st.session_state["portfolio_memory"].items():
+            # [NEW] 타겟 키가 지정되었고, 현재 루프의 키가 타겟이 아니면 스킵 (단일 타격)
+            if target_key is not None and key != target_key:
+                continue
+
             data_str = df.to_json(orient="records", date_format="iso")
             if key in key_to_row:
                 row_idx = key_to_row[key]
@@ -1137,7 +1141,7 @@ def merge_preserved_portfolio_state(fresh_df, saved_df):
 
 def save_portfolio_snapshot(state_key):
     st.session_state["portfolio_memory"][state_key] = st.session_state["editor_df"].copy()
-    save_portfolio_memory()
+    save_portfolio_memory(state_key)
     st.toast("✅ 현재 구성이 안전하게 저장되었습니다.")
 
 
