@@ -1672,13 +1672,28 @@ def build_corporate_summary(
                 max_count = max(max_count_nums) if max_count_nums else 0
                 max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
             else:
-                our_score = evaluate_score(
-                    verified_amount_eok,
-                    criteria_row.get(columns["supervision_hurdle"], ""),
-                    criteria_row.get(columns["supervision_score"], ""),
-                )
-                max_amount_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_hurdle"], ""))
-                max_scores_nums = parse_pipe_numbers(criteria_row.get(columns["supervision_score"], ""))
+                raw_text = criteria_row.get(columns["supervision_score"], "")
+                if not raw_text and columns.get("supervision_hurdle"):
+                    raw_text = criteria_row.get(columns["supervision_hurdle"], "")
+
+                parsed_scales = parse_all_supervision_scales(raw_text)
+                scale_options = list(parsed_scales.keys())
+
+                default_idx = 0
+                for i, opt in enumerate(scale_options):
+                    if "100억원 이상" in opt:
+                        default_idx = i
+                        break
+
+                if scale_options:
+                    active_hurdle, active_score = parsed_scales[scale_options[default_idx]]
+                else:
+                    active_hurdle, active_score = ("", "")
+
+                our_score = evaluate_score(verified_amount_eok, active_hurdle, active_score)
+                max_amount_nums = parse_pipe_numbers(active_hurdle)
+                max_scores_nums = parse_pipe_numbers(active_score)
+
                 max_score = max(max_scores_nums) if max_scores_nums else 0.0
                 max_count = 0
                 max_amount_eok_val = max(max_amount_nums) if max_amount_nums else 0
