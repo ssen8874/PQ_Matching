@@ -1744,20 +1744,27 @@ def render_corporate_dashboard(
         return
 
     def _status(row):
-        count_ok = (row["만점건수"] <= 0) or (row["당사건수"] >= row["만점건수"])
-        amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
-        return "✅ 달성" if (count_ok and amount_ok) else "🚨 미달"
+        if business_type == "설계":
+            count_ok = (row["만점건수"] <= 0) or (row["당사건수"] >= row["만점건수"])
+            amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
+            return "✅ 달성" if (count_ok and amount_ok) else "🚨 미달"
+        else:
+            amount_ok = (row["만점금액억"] <= 0) or (row["당사금액억"] >= row["만점금액억"])
+            return "✅ 달성" if amount_ok else "🚨 미달"
+
+    if business_type == "설계":
+        perf_str = lambda r: f"{r['당사건수']:.2f}건 / {r['당사금액억']:.2f}억"
+        target_str = lambda r: f"{int(r['만점건수'])}건 / {r['만점금액억']:.0f}억"
+    else:
+        perf_str = lambda r: f"{r['당사금액억']:.2f}억"
+        target_str = lambda r: f"{r['만점금액억']:.0f}억"
 
     flat_df = pd.DataFrame(
         {
             "발주처": summary_df["발주처"],
             "공종": summary_df["공종"],
-            "당사 실적": summary_df.apply(
-                lambda r: f"{r['당사건수']:.2f}건 / {r['당사금액억']:.2f}억", axis=1
-            ),
-            "만점 기준": summary_df.apply(
-                lambda r: f"{int(r['만점건수'])}건 / {r['만점금액억']:.0f}억", axis=1
-            ),
+            "당사 실적": summary_df.apply(perf_str, axis=1),
+            "만점 기준": summary_df.apply(target_str, axis=1),
             "상태": summary_df.apply(_status, axis=1),
         }
     )
