@@ -320,10 +320,12 @@ CRITERIA_REQUEST_HEADERS = [
 
 def append_criteria_request_to_sheet(row_data):
     """신규 세부평가기준 요청 행을 구글 스프레드시트에 추가. 시트 없으면 자동 생성."""
-    if not os.path.exists(SECRETS_PATH):
-        raise FileNotFoundError(f"'{SECRETS_PATH}' 파일을 찾을 수 없습니다. 현재 폴더에 파일을 배치하세요.")
-
-    credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+    try:
+        credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
+    except (KeyError, FileNotFoundError, Exception):
+        if not os.path.exists(SECRETS_PATH):
+            raise FileNotFoundError("인증 정보가 없습니다. Streamlit Secrets 또는 로컬 파일을 확인하세요.")
+        credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
     client = gspread.authorize(credentials)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
 
@@ -339,9 +341,12 @@ def append_criteria_request_to_sheet(row_data):
 
 def append_performance_requests_to_sheet(request_df, requester_name):
     """다중 실적 행을 구글 스프레드시트에 일괄 추가. 시트 없으면 자동 생성."""
-    if not os.path.exists(SECRETS_PATH):
-        raise FileNotFoundError("secrets.json 누락")
-    credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+    try:
+        credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
+    except (KeyError, FileNotFoundError, Exception):
+        if not os.path.exists(SECRETS_PATH):
+            raise FileNotFoundError("인증 정보가 없습니다. Streamlit Secrets 또는 로컬 파일을 확인하세요.")
+        credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
     client = gspread.authorize(credentials)
     spreadsheet = client.open_by_key(SPREADSHEET_ID)
 
