@@ -1,6 +1,22 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
+
+
 import io
 import math
 import os
+import pickle
 import re
 from datetime import datetime, timedelta
 
@@ -31,66 +47,24 @@ SIDEBAR_SLIM_DIVIDER = (
     "<hr style='margin-top: 5px; margin-bottom: 5px; border: none; "
     "border-top: 1px solid #e6e6e6;'/>"
 )
-PORTFOLIO_SHEET_NAME = "포트폴리오_기억소"
+PORTFOLIO_DB_PATH = "portfolio_memory.pkl"
+
 
 def load_portfolio_memory():
     if "portfolio_memory" not in st.session_state:
-        st.session_state["portfolio_memory"] = {}
-        try:
+        if os.path.exists(PORTFOLIO_DB_PATH):
             try:
-                credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
-            except (KeyError, FileNotFoundError, Exception):
-                if not os.path.exists(SECRETS_PATH):
-                    return
-                credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
+                with open(PORTFOLIO_DB_PATH, "rb") as f:
+                    st.session_state["portfolio_memory"] = pickle.load(f)
+            except Exception:
+                st.session_state["portfolio_memory"] = {}
+        else:
+            st.session_state["portfolio_memory"] = {}
 
-            client = gspread.authorize(credentials)
-            spreadsheet = client.open_by_key(SPREADSHEET_ID)
-
-            try:
-                worksheet = spreadsheet.worksheet(PORTFOLIO_SHEET_NAME)
-                records = worksheet.get_all_records()
-                for row in records:
-                    key = row.get("Key")
-                    data_str = row.get("Data")
-                    if key and data_str:
-                        st.session_state["portfolio_memory"][key] = pd.read_json(io.StringIO(data_str))
-            except WorksheetNotFound:
-                pass  # 시트가 없으면 빈 깡통 상태 유지
-        except Exception:
-            pass  # 로드 실패 시 시스템 크래시 방지
 
 def save_portfolio_memory():
-    try:
-        try:
-            credentials = Credentials.from_service_account_info(st.secrets["gcp_service_account"], scopes=SCOPES)
-        except (KeyError, FileNotFoundError, Exception):
-            if not os.path.exists(SECRETS_PATH):
-                raise FileNotFoundError("인증 정보가 없습니다.")
-            credentials = Credentials.from_service_account_file(SECRETS_PATH, scopes=SCOPES)
-
-        client = gspread.authorize(credentials)
-        spreadsheet = client.open_by_key(SPREADSHEET_ID)
-
-        try:
-            worksheet = spreadsheet.worksheet(PORTFOLIO_SHEET_NAME)
-        except WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=PORTFOLIO_SHEET_NAME, rows=1000, cols=3)
-
-        # 데이터 무결성을 위해 기존 데이터를 덮어쓰기 (초기화 후 일괄 삽입)
-        worksheet.clear()
-        worksheet.append_row(["Key", "Data", "Updated_At"])
-
-        rows_to_insert = []
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for key, df in st.session_state["portfolio_memory"].items():
-            data_str = df.to_json(orient="records", date_format="iso")
-            rows_to_insert.append([key, data_str, now_str])
-
-        if rows_to_insert:
-            worksheet.append_rows(rows_to_insert, value_input_option="USER_ENTERED")
-    except Exception as e:
-        st.error(f"포트폴리오 클라우드 DB 동기화 실패: {e}")
+    with open(PORTFOLIO_DB_PATH, "wb") as f:
+        pickle.dump(st.session_state["portfolio_memory"], f)
 
 
 def convert_df_to_excel(df):
