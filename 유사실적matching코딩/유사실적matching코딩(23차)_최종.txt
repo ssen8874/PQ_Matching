@@ -1,3 +1,16 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -1526,10 +1539,10 @@ def render_criteria_detail(raw_text):
 def filter_aggregate_source_df(edited_df, business_type):
     """Table A(등록) 또는 선택 행만 집계 대상으로 필터."""
     df = cast_numeric_columns(edited_df.copy())
-    # 사업구분(설계/감리) 상관없이 '등록여부' 컬럼이 있으면 등록된 실적만 필터링
-    if "등록여부" in df.columns:
-        df["등록여부"] = df["등록여부"].fillna(False).astype(bool)
-        df = df[df["등록여부"] == True].copy()
+    if business_type == "설계":
+        if "등록여부" in df.columns:
+            df["등록여부"] = df["등록여부"].fillna(False).astype(bool)
+            df = df[df["등록여부"] == True].copy()
     elif "선택" in df.columns:
         df["선택"] = df["선택"].fillna(True).astype(bool)
         df = df[df["선택"] == True].copy()
