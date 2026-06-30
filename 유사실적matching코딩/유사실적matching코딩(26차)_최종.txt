@@ -1,3 +1,15 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -167,10 +179,7 @@ def convert_df_to_excel(df):
             if export_df.empty:
                 max_len = len(str(col_name)) + 3
             else:
-                # [NEW] PyArrow 환경 TypeError 방어: map(len) 대신 판다스 네이티브 str.len() 사용 및 결측치 안전 처리
-                col_max = export_df[col_name].astype(str).str.len().max()
-                col_max = 0 if pd.isna(col_max) else int(col_max)
-                max_len = max(col_max, len(str(col_name))) + 3
+                max_len = max(export_df[col_name].astype(str).map(len).max(), len(str(col_name))) + 3
             worksheet.column_dimensions[col_letter].width = min(max_len, 60)
 
             for cell in worksheet[col_letter][1:]:
