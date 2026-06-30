@@ -1,3 +1,17 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -95,10 +109,7 @@ def save_portfolio_memory(target_key=None):
             if target_key is not None and key != target_key:
                 continue
 
-            # [NEW] 5만자 제한 방어: 무거운 텍스트 컬럼을 버리고 복원에 필수적인 식별자와 상태값만 추출하여 초압축
-            essential_cols = [c for c in ["실적ID", "등록여부", "선택", "인정률(%)", "실적증명서 발급여부"] if c in df.columns]
-            compressed_df = df[essential_cols]
-            data_str = compressed_df.to_json(orient="records", date_format="iso")
+            data_str = df.to_json(orient="records", date_format="iso")
             if key in key_to_row:
                 row_idx = key_to_row[key]
                 batch_updates.append({
@@ -115,11 +126,8 @@ def save_portfolio_memory(target_key=None):
             if not col_a or col_a[0] != "Key":
                 rows_to_append = [["Key", "Data", "Updated_At"]] + rows_to_append
             worksheet.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-
-        return True  # [NEW] 성공 시 True 반환
     except Exception as e:
         st.error(f"포트폴리오 클라우드 DB 동기화 실패: {e}")
-        return False  # [NEW] 실패 시 False 반환
 
 
 def convert_df_to_excel(df):
@@ -1147,9 +1155,8 @@ def merge_preserved_portfolio_state(fresh_df, saved_df):
 
 def save_portfolio_snapshot(state_key):
     st.session_state["portfolio_memory"][state_key] = st.session_state["editor_df"].copy()
-    is_success = save_portfolio_memory(state_key)
-    if is_success:
-        st.toast("✅ 현재 구성이 안전하게 저장되었습니다.")
+    save_portfolio_memory(state_key)
+    st.toast("✅ 현재 구성이 안전하게 저장되었습니다.")
 
 
 def parse_portfolio_state_key(state_key):
