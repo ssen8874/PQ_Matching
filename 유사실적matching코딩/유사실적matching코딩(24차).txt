@@ -1,3 +1,16 @@
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -1585,14 +1598,8 @@ def aggregate_recognition_totals(edited_df, business_type, base_date, recognitio
         verified_count, verified_amount = compute_design_recognition_totals(verified_df)
         return verified_count, verified_amount, all_count, all_amount
 
-    # [NEW] 감리 모드: 낡은 자체 계산식을 버리고, 프론트에서 주입된 '적용금액'을 무조건 단순 합산
-    if "적용금액" in df.columns:
-        all_amount = float(pd.to_numeric(df["적용금액"], errors="coerce").fillna(0.0).sum())
-        verified_amount = float(pd.to_numeric(verified_df["적용금액"], errors="coerce").fillna(0.0).sum())
-    else:
-        all_amount = compute_supervision_recognition_total(df, base_date, recognition_years)
-        verified_amount = compute_supervision_recognition_total(verified_df, base_date, recognition_years)
-
+    all_amount = compute_supervision_recognition_total(df, base_date, recognition_years)
+    verified_amount = compute_supervision_recognition_total(verified_df, base_date, recognition_years)
     return 0.0, verified_amount, 0.0, all_amount
 
 
@@ -1703,15 +1710,10 @@ def build_corporate_summary(
                 recognition_years, amount_filter_col, min_amount_eok,
             )
 
-            # [NEW] 총괄표에서도 항상 최신 마스터 데이터(금액)와 저장된 장바구니(체크박스)를 실시간 병합
-            fresh_df = build_fresh_sync_frame(company_filtered)
             if state_key in portfolio:
-                saved_df = portfolio[state_key].copy()
-                merged_df = merge_preserved_portfolio_state(fresh_df, saved_df)
-                merged_df = append_filter_excluded_registrations(merged_df, saved_df)
-                editor_df = ensure_editor_bool_columns(merged_df)
+                editor_df = ensure_editor_bool_columns(portfolio[state_key].copy())
             else:
-                editor_df = ensure_editor_bool_columns(fresh_df)
+                editor_df = ensure_editor_bool_columns(build_fresh_sync_frame(company_filtered))
 
             company_date_filtered = filter_company_for_work_type(
                 company, wt, business_type, base_date,
@@ -1722,10 +1724,6 @@ def build_corporate_summary(
 
             editor_df["실적ID"] = editor_df["실적ID"].astype(str)
             editor_df = editor_df[editor_df["실적ID"].isin(date_scope_ids)].copy()
-
-            # [NEW] 감리 모드인 경우, 총괄표 집계 직전에 '적용금액' 연산 컬럼을 실시간으로 강제 주입
-            if business_type == "감리":
-                editor_df = inject_supervision_calc_cols(editor_df, pd.Timestamp(base_date) - pd.DateOffset(years=3) + pd.DateOffset(days=1), pd.Timestamp(base_date))
 
             verified_count, verified_amount_won, _, _ = aggregate_recognition_totals(
                 editor_df, business_type, base_date, recognition_years
@@ -2042,9 +2040,6 @@ def main():
         st.write("")
         if st.button("🔄 데이터 최신화", use_container_width=True):
             load_sheet_data.clear()
-            # [NEW] 장바구니 메모리를 완전 소각하여 구글 시트와 강제 동기화 유도
-            if "portfolio_memory" in st.session_state:
-                del st.session_state["portfolio_memory"]
             st.session_state["force_sync"] = True
             st.rerun()
 
