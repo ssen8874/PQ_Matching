@@ -1,4 +1,18 @@
-import hashlib
+powershell->
+PS D:\Desktop\PQ_Matching> streamlit run pq_matching.py
+
+http://localhost:8501/
+http://192.168.140.118:8501
+
+
+
+
+
+
+
+
+
+
 import io
 import math
 import os
@@ -456,6 +470,7 @@ def prepare_company_dataframe(company_df):
     if orderer_col is None or work_type_col is None:
         raise ValueError("회사실적 시트에서 '발주처' 또는 '공종' 컬럼을 찾지 못했습니다.")
 
+    company["실적ID"] = range(1, len(company) + 1)
     company["발주처_유형"] = company[orderer_col].apply(classify_orderer)
     company["발주처"] = company[orderer_col].astype(str).str.strip()
     company["사업구분"] = company[biz_col].astype(str).str.strip() if biz_col else ""
@@ -485,13 +500,6 @@ def prepare_company_dataframe(company_df):
     else:
         company["지분금액"] = company["준공금액"]
     company["건수"] = pd.to_numeric(company[count_col].apply(to_number), errors="coerce").fillna(0.0) if count_col else 1.0
-
-    # [NEW] 금액 등 변동 데이터를 배제하고, 절대 불변하는 핵심 식별 데이터 4종으로만 영구적 Hash ID 부여
-    def generate_hash_id(row):
-        base_str = str(row.get("사업구분", "")) + str(row.get("공종", "")) + str(row.get("사업명", "")) + str(row.get("발주처", ""))
-        return hashlib.md5(base_str.encode('utf-8')).hexdigest()[:10]
-
-    company["실적ID"] = company.apply(generate_hash_id, axis=1)
 
     # [1] 백엔드 연산용 (시작일/종료일): 반드시 datetime으로 파싱 (기존 로직 유지, 에러 없음)
     calc_start_col = find_column(company, ["시작일"])
